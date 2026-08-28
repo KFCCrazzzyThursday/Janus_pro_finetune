@@ -4,6 +4,7 @@ __pycache__/
 .venv*/
 .uv-cache/
 .hf_home/
+.tmp/
 .cache/
 *.egg-info/
 upstream/

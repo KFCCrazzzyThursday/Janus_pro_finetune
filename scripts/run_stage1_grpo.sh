@@ -97,8 +97,8 @@ COMMON_ARGS=(
   --check_model false
   --dataset "${GRPO_DATASET}"
   --split_dataset_ratio 0
-  --dataset_num_proc 4
-  --dataloader_num_workers 2
+  --dataset_num_proc "${JANUS_GRPO_DATASET_NUM_PROC:-4}"
+  --dataloader_num_workers "${JANUS_GRPO_DATALOADER_WORKERS:-2}"
   --external_plugins \
     "${ROOT_DIR}/training/plugins/fsdp2_janus_compat.py" \
     "${ROOT_DIR}/training/plugins/scienceqa_grpo.py"

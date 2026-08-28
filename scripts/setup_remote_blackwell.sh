@@ -5,11 +5,16 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${JANUS_VENV:-${ROOT_DIR}/.venv}"
 export HF_HOME="${HF_HOME:-${ROOT_DIR}/.hf_home}"
 export HF_XET_CACHE="${HF_XET_CACHE:-${HF_HOME}/xet}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${ROOT_DIR}/.cache}"
+export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-${XDG_CACHE_HOME}/modelscope}"
+export TORCH_HOME="${TORCH_HOME:-${XDG_CACHE_HOME}/torch}"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-${ROOT_DIR}/.uv-cache}"
 export TMPDIR="${TMPDIR:-${ROOT_DIR}/.tmp}"
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
-mkdir -p "${HF_HOME}" "${HF_XET_CACHE}" "${UV_CACHE_DIR}" "${TMPDIR}"
+mkdir -p \
+  "${HF_HOME}" "${HF_XET_CACHE}" "${XDG_CACHE_HOME}" \
+  "${MODELSCOPE_CACHE}" "${TORCH_HOME}" "${UV_CACHE_DIR}" "${TMPDIR}"
 
 if ! command -v uv >/dev/null 2>&1; then
   echo "uv is required on the remote host." >&2
