@@ -11,9 +11,13 @@ hooks are active only when all four ``Janus*Reward`` classes below are selected.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import hashlib
 import json
 import math
 import os
+import sqlite3
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
@@ -98,6 +102,11 @@ Return only one JSON object with exactly these four keys and integer values 0 or
 {"answer_relevance": 0, "logical_clarity": 0, "factual_correctness": 0, "teacher_style": 0}
 """
 
+_BATCH_REASONING_JUDGE_PROMPT = """Score each candidate independently on four binary criteria:
+relevance, clarity, factual correctness, and teacher-like explanation.
+Return JSON only: {"results":[{"id":0,"r":0,"c":0,"f":0,"t":0}]}.
+Use each input id exactly once; every score must be integer 0 or 1."""
+
 
 class JanusReasoningReward(AsyncORM):
     janus_component = "reasoning"
@@ -123,9 +132,94 @@ class JanusReasoningReward(AsyncORM):
             )
         self.max_concurrency = int(os.environ.get("JANUS_JUDGE_CONCURRENCY", "8"))
         self.log_dir = Path(os.environ.get("JANUS_JUDGE_LOG_DIR", "outputs/stage1_grpo/judge_calls"))
+        self.batch_size = max(1, int(os.environ.get("JANUS_JUDGE_BATCH_SIZE", "1")))
+        self.sample_fraction = min(1.0, max(0.0, float(os.environ.get("JANUS_JUDGE_SAMPLE_FRACTION", "1"))))
+        self.activation_threshold = float(os.environ.get("JANUS_JUDGE_ACTIVATION_THRESHOLD", "0.60"))
+        self.skip_homogeneous = (
+            os.environ.get("JANUS_JUDGE_SKIP_HOMOGENEOUS", "1") == "1"
+            and bool(getattr(args, "dynamic_sample", False))
+        )
+        self.compact_prompt = os.environ.get("JANUS_JUDGE_COMPACT_PROMPT", "0") == "1"
+        self.max_reasoning_chars = max(0, int(os.environ.get("JANUS_JUDGE_MAX_REASONING_CHARS", "0")))
+        self.cache_enabled = os.environ.get("JANUS_JUDGE_CACHE", "1") == "1" and not self.smoke_stub
+        self.cache_path = Path(
+            os.environ.get("JANUS_JUDGE_CACHE_PATH", str(self.log_dir.parent / "judge_cache.sqlite3"))
+        )
+        self.prompt_version = os.environ.get("JANUS_JUDGE_PROMPT_VERSION", "v1")
+        self.process_group = None
+        self.stats: dict[str, int] = defaultdict(int)
+        if self.cache_enabled:
+            self._init_cache()
 
-    @staticmethod
+    def _connect_cache(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.cache_path, timeout=30)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=30000")
+        return connection
+
+    def _init_cache(self) -> None:
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect_cache() as connection:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS judge_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    model TEXT NOT NULL,
+                    prompt_version TEXT NOT NULL,
+                    response TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    created_at REAL NOT NULL
+                )"""
+            )
+
+    def _cache_key(
+        self,
+        completion: str,
+        question: str,
+        choices: Sequence[str],
+        answer_text: str,
+        answer_index: int,
+    ) -> str:
+        canonical = json.dumps(
+            {
+                "model": self.model,
+                "prompt_version": self.prompt_version,
+                "batch_prompt": self.batch_size > 1,
+                "compact_prompt": self.compact_prompt,
+                "max_reasoning_chars": self.max_reasoning_chars,
+                "question": question,
+                "choices": list(choices),
+                "answer_text": answer_text,
+                "answer_index": answer_index,
+                "completion": completion,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _cache_get(self, cache_key: str) -> tuple[str, float] | None:
+        if not self.cache_enabled:
+            return None
+        with self._connect_cache() as connection:
+            row = connection.execute(
+                "SELECT response, score FROM judge_cache WHERE cache_key = ?", (cache_key,)
+            ).fetchone()
+        return None if row is None else (str(row[0]), float(row[1]))
+
+    def _cache_put(self, cache_key: str, response: str, score: float) -> None:
+        if not self.cache_enabled:
+            return
+        with self._connect_cache() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO judge_cache
+                   (cache_key, model, prompt_version, response, score, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (cache_key, self.model, self.prompt_version, response, score, time.time()),
+            )
+
     def _activation_mask(
+        self,
         completions: Sequence[str],
         answer_indices: Sequence[int],
         prompt_ids: Sequence[str],
@@ -136,8 +230,9 @@ class JanusReasoningReward(AsyncORM):
             for completion, gold, prompt_id in zip(completions, answer_indices, prompt_ids)
         ]
         if dist.is_available() and dist.is_initialized():
-            gathered: list[Any] = [None] * dist.get_world_size()
-            dist.all_gather_object(gathered, local_rows)
+            group = self.process_group
+            gathered: list[Any] = [None] * dist.get_world_size(group=group)
+            dist.all_gather_object(gathered, local_rows, group=group)
             all_rows = [row for rank_rows in gathered for row in rank_rows]
         else:
             all_rows = local_rows
@@ -151,7 +246,12 @@ class JanusReasoningReward(AsyncORM):
             raise RuntimeError(
                 f"Reasoning-reward groups do not have G={expected_group_size} completions: {bad_sizes}"
             )
-        return [stats[str(prompt_id)][0] / stats[str(prompt_id)][1] > 0.60 for prompt_id in prompt_ids]
+        active = []
+        for prompt_id in prompt_ids:
+            correct, total = stats[str(prompt_id)]
+            ratio = correct / total
+            active.append(ratio > self.activation_threshold and not (self.skip_homogeneous and correct == total))
+        return active
 
     @staticmethod
     def _binary(value: Any) -> int:
@@ -161,60 +261,108 @@ class JanusReasoningReward(AsyncORM):
             return int(float(value) >= 0.5)
         return int(str(value).strip().lower() in {"1", "true", "yes", "pass"})
 
-    async def _judge_one(
+    def _compact_completion(self, completion: str) -> str:
+        if not self.compact_prompt:
+            return completion
+        parsed = parse_completion(completion)
+        reasoning = parsed.reasoning or completion
+        if self.max_reasoning_chars and len(reasoning) > self.max_reasoning_chars:
+            reasoning = reasoning[: self.max_reasoning_chars] + "…"
+        return f"reasoning={reasoning}\nanswer_index={parsed.choice_index}"
+
+    @staticmethod
+    def _score_result(result: dict[str, Any], compact: bool) -> float:
+        keys = ("r", "c", "f", "t") if compact else (
+            "answer_relevance", "logical_clarity", "factual_correctness", "teacher_style"
+        )
+        return sum(JanusReasoningReward._binary(result.get(key, 0)) for key in keys) / 4.0
+
+    async def _judge_batch(
         self,
         semaphore: asyncio.Semaphore,
-        completion: str,
+        rows: list[dict[str, Any]],
         question: str,
         choices: Sequence[str],
         answer_text: str,
         answer_index: int,
-        prompt_id: str,
-    ) -> float:
+    ) -> list[float]:
         if self.smoke_stub:
-            raw = json.dumps(
-                {
-                    "answer_relevance": 0,
-                    "logical_clarity": 0,
-                    "factual_correctness": 0,
-                    "teacher_style": 0,
-                    "smoke_stub": True,
-                },
-                sort_keys=True,
-            )
-            self._write_log(prompt_id, question, completion, raw, 0.0, None)
-            return 0.0
+            for row in rows:
+                raw = json.dumps({"r": 0, "c": 0, "f": 0, "t": 0, "smoke_stub": True}, sort_keys=True)
+                self._write_log(row["prompt_id"], question, row["completion"], raw, 0.0, None)
+            return [0.0] * len(rows)
 
+        pending: list[dict[str, Any]] = []
+        scores: list[float | None] = [None] * len(rows)
+        for position, row in enumerate(rows):
+            cache_key = self._cache_key(
+                row["completion"], question, choices, answer_text, answer_index
+            )
+            cached = self._cache_get(cache_key)
+            if cached is None:
+                pending.append({**row, "position": position, "cache_key": cache_key})
+            else:
+                raw, score = cached
+                self.stats["cache_hits"] += 1
+                scores[position] = score
+                self._write_log(
+                    row["prompt_id"], question, row["completion"], raw, score, None, cache_hit=True
+                )
+        if not pending:
+            return [float(score) for score in scores]
+
+        compact = self.compact_prompt or self.batch_size > 1
+        candidates = [
+            {"id": index, "text": self._compact_completion(row["completion"])}
+            for index, row in enumerate(pending)
+        ]
         payload = (
-            f"Question: {question}\n"
-            f"Choices: {json.dumps(list(choices), ensure_ascii=False)}\n"
-            f"Reference answer: index {answer_index}, {answer_text}\n"
-            f"Candidate answer and reasoning:\n{completion}"
+            f"Q:{question}\nC:{json.dumps(list(choices), ensure_ascii=False, separators=(',', ':'))}\n"
+            f"Gold:{answer_index}|{answer_text}\nCandidates:{json.dumps(candidates, ensure_ascii=False, separators=(',', ':'))}"
         )
         error: Exception | None = None
         for attempt in range(5):
             try:
                 async with semaphore:
+                    self.stats["api_batches"] += 1
+                    self.stats["api_candidates"] += len(pending)
                     response = await self.client.chat.completions.create(  # type: ignore[union-attr]
                         model=self.model,
                         temperature=0,
                         response_format={"type": "json_object"},
                         messages=[
-                            {"role": "system", "content": _REASONING_JUDGE_PROMPT},
+                            {
+                                "role": "system",
+                                "content": _BATCH_REASONING_JUDGE_PROMPT if compact else _REASONING_JUDGE_PROMPT,
+                            },
                             {"role": "user", "content": payload},
                         ],
                     )
                 raw = response.choices[0].message.content or "{}"
                 parsed = json.loads(raw)
-                keys = ("answer_relevance", "logical_clarity", "factual_correctness", "teacher_style")
-                score = sum(self._binary(parsed.get(key, 0)) for key in keys) / 4.0
-                self._write_log(prompt_id, question, completion, raw, score, None)
-                return score
+                results = parsed.get("results") if compact else [parsed]
+                if not isinstance(results, list) or len(results) != len(pending):
+                    raise ValueError(f"judge returned {len(results) if isinstance(results, list) else 'invalid'} results; expected {len(pending)}")
+                by_id = {int(result.get("id", index)): result for index, result in enumerate(results)}
+                if set(by_id) != set(range(len(pending))):
+                    raise ValueError("judge result ids do not match candidate ids")
+                for index, row in enumerate(pending):
+                    result = by_id[index]
+                    score = self._score_result(result, compact)
+                    result_raw = json.dumps(result, ensure_ascii=False, sort_keys=True)
+                    scores[row["position"]] = score
+                    self._cache_put(row["cache_key"], result_raw, score)
+                    self._write_log(
+                        row["prompt_id"], question, row["completion"], result_raw, score, None,
+                        cache_hit=False,
+                    )
+                return [float(score) for score in scores]
             except Exception as exc:  # retry transient API and JSON failures, but never silently score them
                 error = exc
                 await asyncio.sleep(min(2**attempt, 16))
-        self._write_log(prompt_id, question, completion, "", None, repr(error))
-        raise RuntimeError(f"Reasoning judge failed after 5 attempts for prompt_id={prompt_id}") from error
+        for row in pending:
+            self._write_log(row["prompt_id"], question, row["completion"], "", None, repr(error))
+        raise RuntimeError(f"Reasoning judge failed after 5 attempts for prompt_id={pending[0]['prompt_id']}") from error
 
     def _write_log(
         self,
@@ -224,6 +372,8 @@ class JanusReasoningReward(AsyncORM):
         response: str,
         score: float | None,
         error: str | None,
+        cache_hit: bool = False,
+        estimated: bool = False,
     ) -> None:
         rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -236,6 +386,8 @@ class JanusReasoningReward(AsyncORM):
             "judge_response": response,
             "score": score,
             "error": error,
+            "cache_hit": cache_hit,
+            "estimated": estimated,
         }
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
@@ -250,6 +402,7 @@ class JanusReasoningReward(AsyncORM):
         prompt_id,
         **kwargs,
     ) -> list[float]:
+        stats_before = dict(self.stats)
         size = len(completions)
         indices = [int(value) for value in _as_list(answer_index, size, -1)]
         texts = [str(value) for value in _as_list(answer_text, size, "")]
@@ -260,25 +413,81 @@ class JanusReasoningReward(AsyncORM):
         active = self._activation_mask(completions, indices, prompt_ids, group_size)
 
         semaphore = asyncio.Semaphore(self.max_concurrency)
-        tasks: dict[int, asyncio.Task[float]] = {}
-        for i, enabled in enumerate(active):
+        grouped: dict[str, list[int]] = defaultdict(list)
+        for index, enabled in enumerate(active):
             if enabled:
-                tasks[i] = asyncio.create_task(
-                    self._judge_one(
-                        semaphore,
-                        completions[i],
-                        questions[i],
-                        choice_rows[i],
-                        texts[i],
-                        indices[i],
-                        prompt_ids[i],
+                grouped[prompt_ids[index]].append(index)
+
+        selected_by_prompt: dict[str, list[int]] = {}
+        for current_prompt_id, prompt_indices in grouped.items():
+            sample_count = len(prompt_indices)
+            if self.sample_fraction < 1.0:
+                sample_count = max(1, math.ceil(len(prompt_indices) * self.sample_fraction))
+            # Content-derived ordering makes sampling reproducible across restarts.
+            selected_by_prompt[current_prompt_id] = sorted(
+                prompt_indices,
+                key=lambda i: hashlib.sha256(
+                    f"{self.prompt_version}\0{current_prompt_id}\0{completions[i]}".encode("utf-8")
+                ).digest(),
+            )[:sample_count]
+
+        tasks: list[tuple[str, list[int], asyncio.Task[list[float]]]] = []
+        for current_prompt_id, selected in selected_by_prompt.items():
+            for start in range(0, len(selected), self.batch_size):
+                chunk = selected[start : start + self.batch_size]
+                first = chunk[0]
+                rows = [
+                    {"prompt_id": prompt_ids[i], "completion": completions[i]}
+                    for i in chunk
+                ]
+                tasks.append(
+                    (
+                        current_prompt_id,
+                        chunk,
+                        asyncio.create_task(
+                            self._judge_batch(
+                                semaphore,
+                                rows,
+                                questions[first],
+                                choice_rows[first],
+                                texts[first],
+                                indices[first],
+                            )
+                        ),
                     )
                 )
         rewards = [0.0] * size
         if tasks:
-            values = await asyncio.gather(*tasks.values())
-            for index, value in zip(tasks, values):
-                rewards[index] = value
+            values = await asyncio.gather(*(task for _, _, task in tasks))
+            sampled_scores: dict[str, list[float]] = defaultdict(list)
+            for (current_prompt_id, chunk, _), chunk_values in zip(tasks, values):
+                for index, value in zip(chunk, chunk_values):
+                    rewards[index] = value
+                    sampled_scores[current_prompt_id].append(value)
+            if self.sample_fraction < 1.0:
+                for current_prompt_id, prompt_indices in grouped.items():
+                    estimate = sum(sampled_scores[current_prompt_id]) / len(sampled_scores[current_prompt_id])
+                    selected = set(selected_by_prompt[current_prompt_id])
+                    for index in prompt_indices:
+                        if index not in selected:
+                            rewards[index] = estimate
+                            self.stats["estimated_candidates"] += 1
+                            self._write_log(
+                                prompt_ids[index], questions[index], completions[index], "", estimate, None,
+                                estimated=True,
+                            )
+        delta = {
+            key: value - stats_before.get(key, 0)
+            for key, value in self.stats.items()
+            if value != stats_before.get(key, 0)
+        }
+        logger.info(
+            "Janus judge: active=%d/%d sampled=%d batches=%d cache_hits=%d estimated=%d",
+            sum(active), size,
+            delta.get("api_candidates", 0) + delta.get("cache_hits", 0),
+            delta.get("api_batches", 0), delta.get("cache_hits", 0),
+            delta.get("estimated_candidates", 0),
+        )
         return rewards
 
 
@@ -434,6 +643,26 @@ def _install_group_level_hooks() -> None:
     original_rewards = GRPOTrainer._compute_rewards_per_func
     original_advantages = GRPOTrainer._compute_advantages
     original_compute_std = GRPOTrainer.compute_std
+    original_score_completions = GRPOTrainer._score_completions
+
+    def prefetch_reasoning_cache(self, samples):
+        reasoning_func = next(
+            (func for func in self.reward_funcs if getattr(func, "janus_component", None) == "reasoning"),
+            None,
+        )
+        if reasoning_func is None:
+            return
+        if not samples:
+            # Other ranks may own every retained completion in this round, but
+            # this rank must still enter the activation-mask collective.
+            reasoning_func._activation_mask([], [], [], self.num_generations)
+            return
+        from swift.dataset import RowPreprocessor
+
+        reward_rows = [sample.to_reward_row() for sample in samples]
+        reward_kwargs = RowPreprocessor.rows_to_batched(reward_rows)
+        completions = [sample.messages[-1]["content"] for sample in samples]
+        asyncio.run(reasoning_func(completions, **reward_kwargs))
 
     def compute_rewards_per_func(self, samples):
         rewards = original_rewards(self, samples)
@@ -474,6 +703,97 @@ def _install_group_level_hooks() -> None:
         self._metrics[mode]["janus/kl_beta"].append(float(self.beta))
         return rewards
 
+    def score_completions(self, samples):
+        """Discard answer-homogeneous groups before paying for external rewards.
+
+        The Janus hook defines DAPO validity solely from answer variation, so
+        external reasoning scores cannot change which groups survive.  Doing
+        this selection first preserves the selected samples while avoiding
+        judge calls for groups that would immediately be discarded.
+        """
+        indices = _component_indices(self)
+        enabled = os.environ.get("JANUS_JUDGE_PRESAMPLE_FILTER", "1") == "1"
+        if (
+            indices is None
+            or not enabled
+            or not self.dynamic_sample
+            or not self.model.training
+        ):
+            return original_score_completions(self, samples)
+
+        target_size = self.args.generation_batch_size
+        original_samples = samples
+        valid_samples: list[Any] = []
+        resample_count = 0
+        pipeline = os.environ.get("JANUS_JUDGE_PIPELINE", "0") == "1"
+        if pipeline and not hasattr(self, "_janus_judge_pipeline_group"):
+            # Background object collectives must not share the default NCCL
+            # group with generation/dynamic-sampling collectives: their call
+            # orders can interleave and cross-match payloads.  A dedicated CPU
+            # Gloo group isolates the pipeline and allows genuine overlap.
+            self._janus_judge_pipeline_group = (
+                dist.new_group(backend="gloo") if dist.is_available() and dist.is_initialized() else None
+            )
+            reasoning_func = next(
+                func for func in self.reward_funcs
+                if getattr(func, "janus_component", None) == "reasoning"
+            )
+            reasoning_func.process_group = self._janus_judge_pipeline_group
+        futures: list[concurrent.futures.Future[None]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            while resample_count <= self.max_resample_times:
+                valid_mask = _answer_variation_mask(
+                    samples, self.num_generations, self.accelerator.device
+                )
+                # _preprocess_inputs numbers prompt ids from zero on every
+                # resample round. Namespace before gathering so both the final
+                # scorer and background cache prefetch see the same identity.
+                for sample in samples:
+                    sample.prompt_id = f"resample_{resample_count}:{sample.prompt_id}"
+                all_samples = gather_object(samples)
+                valid_samples.extend(
+                    sample for sample, keep in zip(all_samples, valid_mask.tolist()) if keep
+                )
+                if len(valid_samples) >= target_size:
+                    break
+                if resample_count == self.max_resample_times:
+                    break
+
+                if pipeline:
+                    local_size = len(samples)
+                    local_start = self.accelerator.process_index * local_size
+                    local_mask = valid_mask[local_start : local_start + local_size].tolist()
+                    local_valid = [sample for sample, keep in zip(samples, local_mask) if keep]
+                    # Every rank submits one matching job per resample round;
+                    # the reward's activation all-gather therefore remains ordered.
+                    futures.append(executor.submit(prefetch_reasoning_cache, self, local_valid))
+
+                inputs = next(self.dynamic_resample_iterator)
+                if self.template.truncation_strategy == "raise":
+                    inputs = self.resample_encode_failed_inputs(inputs)
+                samples = self._generate_completions(self.to_samples(inputs))
+                resample_count += 1
+
+            for future in futures:
+                future.result()
+
+        if len(valid_samples) >= target_size:
+            local_size = len(samples)
+            process_slice = slice(
+                self.accelerator.process_index * local_size,
+                (self.accelerator.process_index + 1) * local_size,
+            )
+            samples = valid_samples[:target_size][process_slice]
+        else:
+            logger.warning(
+                "Janus presample filter found only %d/%d valid samples after %d retries; using original batch",
+                len(valid_samples), target_size, resample_count,
+            )
+            samples = original_samples
+
+        self._rewards_per_func = self._compute_rewards_per_func(samples)
+        return samples
+
     def compute_std(self, samples, rewards_per_func):
         mask = getattr(self, "_janus_answer_variation_mask", None)
         if mask is not None and mask.numel() == rewards_per_func.shape[0]:
@@ -497,6 +817,7 @@ def _install_group_level_hooks() -> None:
         return advantages
 
     GRPOTrainer._compute_rewards_per_func = compute_rewards_per_func
+    GRPOTrainer._score_completions = score_completions
     GRPOTrainer.compute_std = compute_std
     GRPOTrainer._compute_advantages = compute_advantages
     GRPOTrainer._janus_thesis_hooks_installed = True
