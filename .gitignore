@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv*/
+.uv-cache/
+.hf_home/
+.cache/
+*.egg-info/
+upstream/
+data/
+models/
+outputs/
+logs/
+wandb/
+*.log
+core

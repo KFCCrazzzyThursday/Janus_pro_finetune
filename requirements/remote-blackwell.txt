@@ -1,0 +1,26 @@
+# PyTorch and torchvision are installed separately from the official cu128
+# index by scripts/setup_remote_blackwell.sh.
+accelerate==1.14.0
+datasets==4.8.4
+einops==0.8.2
+hf-xet==1.6.0
+huggingface-hub==0.36.2
+modelscope==1.39.1
+numpy==2.5.2
+openai==3.5.0
+pandas==2.3.3
+peft==0.20.0
+pillow==11.3.0
+protobuf==7.36.0
+psutil==7.2.2
+pytest==9.1.1
+PyYAML==6.0.3
+safetensors==0.8.0
+scipy==1.18.1
+sentencepiece==0.2.2
+tensorboard==2.21.0
+timm==1.0.28
+tokenizers==0.22.2
+transformers-stream-generator==0.0.5
+transformers==4.57.6
+trl==0.29.1

@@ -1,0 +1,183 @@
+project:
+  title: "面向图像生成与理解统一模型的下游微调方法设计"
+  base_model: deepseek-ai/Janus-Pro-7B
+  paper_file: final_print.pdf
+  paper_hardware: "4 x NVIDIA A100 80GB"
+  reproduction_hardware: "4 x NVIDIA L40S 46GB"
+  cuda_visible_devices: "0,1,3,4"
+  migration_hardware: "4 x NVIDIA RTX PRO 6000 Blackwell Server Edition 96GB"
+  migration_cuda_visible_devices: "0,1,2,3"
+
+data:
+  tqa:
+    source: "AllenAI Textbook Question Answering official release"
+    use_context: false
+    question_type: "Diagram Multiple Choice"
+    expected_counts:
+      train: 6501
+      val: 2781
+      test: 3285
+  scienceqa:
+    source: "lupantech/ScienceQA@2cbf8318e07b9ece895bb2ae605e71e38d623264"
+    # Primary stage-1 training view selected for this reproduction.
+    use_context: false
+    image_only: true
+    expected_counts:
+      train: 6218
+      val: 2097
+      test: 2017
+    expected_counts_with_solution:
+      train: 5678
+      val: 1922
+      test: 1836
+    full_official_view:
+      use_context: true
+      expected_counts:
+        train: 12726
+        val: 4241
+        test: 4241
+      expected_counts_with_solution:
+        train: 11515
+        val: 3848
+        test: 3839
+
+stage1:
+  # The thesis says that a ScienceQA SFT warm-up is performed, but does not
+  # report its learning rate, batch size, number of epochs, or exact subset.
+  scienceqa_sft:
+    enabled: true
+    hyperparameters_reported: false
+    # Reproduction assumptions: the thesis omits every warm-up setting below.
+    # We reuse its stage-2 understanding-SFT optimizer and schedule.
+    examples: 5678
+    learning_rate: 2.0e-5
+    lr_scheduler: constant
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    optimizer: adamw_galore
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    galore_update_gap: 128
+    galore_rank: 256
+    batch_size: 64
+    epochs: 3
+    max_steps_derived: 267
+  grpo:
+    dataset: tqa_train
+    examples: 6501
+    dataset_conflict: "Section 1.5 implies ScienceQA; Section 2.3, Figure 3.1, and the middle-school description indicate TQA"
+    difficulty_source: "base-model two-turn estimate with constrained-word fallback, mapped to 0-11 (exact paper prompt not reported)"
+    learning_rate: 1.0e-6
+    lr_scheduler: constant
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    optimizer: adamw_galore
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    galore_update_gap: 128
+    galore_rank: 512
+    batch_size: 8
+    epochs: 4
+    max_steps: 3000
+    num_generations: 16
+    epsilon_low: 0.2
+    epsilon_high: 0.28
+    reward_beta_weights: [0.25, 0.25, 0.45, 0.05]
+    reward_beta_weights_equation_3_11: [0.30, 0.20, 0.45, 0.05]
+    kl_decay_steps: 500
+    length_cubic_scale: 5.0e-7
+    advantage_threshold: 0.2
+    reasoning_activation_accuracy: 0.60
+    # Not stated in the thesis.
+    kl_beta_initial: null
+    reward_weight_decay_lambda: null
+    temperature: null
+    max_completion_length: null
+    random_seed: null
+    reproduction_choices:
+      kl_beta_initial: 0.04
+      reward_weight_decay_lambda: 6.666666666666667e-5
+      temperature: 1.0
+      max_completion_length: 384
+      random_seed: 42
+
+stage2:
+  understanding_sft:
+    examples: 11808
+    learning_rate: 2.0e-5
+    lr_scheduler: constant
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    optimizer: adamw_galore
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    galore_update_gap: 128
+    galore_rank: 256
+    batch_size: 64
+    epochs: 3
+    max_steps: 555
+  joint_sft:
+    vqa_examples: 5500
+    text_examples: 8000
+    image_generation_examples: 13743
+    data_ratio: [2, 3, 5]
+    learning_rate: 1.0e-5
+    lr_scheduler: constant
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    optimizer: adamw_galore
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    galore_update_gap: 128
+    galore_rank: 512
+    batch_size: 64
+    epochs: 3
+    max_steps: 1278
+  generation_grpo:
+    learning_rate: 1.0e-6
+    lr_scheduler: constant
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    optimizer: adamw_galore
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    galore_update_gap: 128
+    galore_rank: 512
+    batch_size: 32
+    epochs: 4
+    max_steps: 3000
+    num_generations: 4
+    epsilon_low: 0.2
+    epsilon_high: 0.28
+    kl_beta: 0.0
+    alpha_epsilon: 1.25e-4
+
+evaluation:
+  paper_rationality_judge: gpt-4o
+  paper_reasoning_reward_judge: gpt-4o-mini
+  reproduction_judge: deepseek-v4-flash-vision-exp
+  reproduction_judge_api: openai_compatible
+  reproduction_judge_base_url: https://api.deepseek.com
+  rationality_repeats: 3
+  # The thesis does not identify the TQA evaluation split, perturbation seed,
+  # image-generation evaluation subset, FID reference set, or decoding params.
+  tqa_split: null
+  perturbation_seed: null
+  generation_eval_subset: null
+  decoding_parameters: null
+  reproduction_choices:
+    tqa_split: test
+    scienceqa_primary_view: full_official_with_hint
+    scienceqa_secondary_view: image_only_without_context
+    perturbation_seed: 42
+    perturbations:
+      - deterministic_option_reorder
+      - "irrelevant prefix: Here is the question for you:"
+    decoding:
+      do_sample: false
+      max_new_tokens: 384
+      batch_size_per_rank: 1
+    cot_filter:
+      overall_threshold: 4.0
+      dimension_threshold: 3.0
+      manual_phase: unavailable

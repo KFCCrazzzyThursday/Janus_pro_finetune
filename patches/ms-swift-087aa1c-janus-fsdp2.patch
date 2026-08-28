@@ -1,0 +1,140 @@
+diff --git a/swift/dataset/loader.py b/swift/dataset/loader.py
+index 6970e95..520398d 100644
+--- a/swift/dataset/loader.py
++++ b/swift/dataset/loader.py
+@@ -215,7 +215,17 @@ def init_self_cognition_preprocessor(
+ 
+ 
+ def _inject_dataset_routing_tag(dataset: DATASET_TYPE, ds_name: str) -> DATASET_TYPE:
+-    """Inject ``dataset`` column for multi-teacher routing (constant per source dataset)."""
++    """Inject ``dataset`` for routing unless the source already supplies it.
++
++    Local JSONL datasets in the Janus pipeline deliberately carry their
++    semantic source name (for example, ``tqa``).  Hugging Face ``Dataset``
++    rejects ``add_column`` when that column already exists, and replacing the
++    caller-provided value with the filesystem path would also lose useful
++    provenance.
++    """
++    column_names = getattr(dataset, 'column_names', None)
++    if column_names is not None and 'dataset' in column_names:
++        return dataset
+     if isinstance(dataset, HfIterableDataset):
+         return dataset.map(lambda example: {**example, 'dataset': ds_name})
+     return dataset.add_column('dataset', [ds_name] * len(dataset))
+diff --git a/swift/infer_engine/transformers_engine.py b/swift/infer_engine/transformers_engine.py
+index f84634a..aeb1a94 100644
+--- a/swift/infer_engine/transformers_engine.py
++++ b/swift/infer_engine/transformers_engine.py
+@@ -9,12 +9,14 @@ import time
+ import torch
+ import torch.nn.functional as F
+ import transformers
++from contextlib import contextmanager
+ from copy import deepcopy
+ from packaging import version
+ from PIL import Image
+ from queue import Queue
+ from threading import Thread
+ from torch import nn
++from torch.distributed.fsdp import FSDPModule
+ from tqdm import tqdm
+ from transformers import GenerationConfig, LogitsProcessorList
+ from transformers.utils import is_torch_npu_available
+@@ -35,6 +37,36 @@ _TRANSFORMERS_GE_5_2 = version.parse(transformers.__version__) >= version.parse(
+ _kernels_patched = False
+ 
+ 
++@contextmanager
++def _manual_fsdp2_root_context(model: nn.Module):
++    """Materialize an FSDP2 root group for a direct submodel operation.
++
++    The Transformers rollout engine calls a multimodal template's
++    ``pre_forward_hook`` directly, before ``generate``.  This bypasses the root
++    FSDP2 forward pre-hook that normally all-gathers root-owned parameters such
++    as Janus' vision tower, aligner, token embeddings, final norm, and LM head.
++    Janus also delegates ``generate`` to its language submodel, which bypasses
++    the same root hook. Temporarily unshard the root around each such direct
++    operation so regular tensors do not meet sharded DTensors.
++    """
++    is_fsdp2 = isinstance(model, FSDPModule)
++    if is_fsdp2:
++        # FSDP2 decides which state is the root from the first FSDP-wrapped
++        # module that runs forward.  Janus generation delegates directly to
++        # ``language_model``; without initializing the actual root first, an
++        # inner transformer block can incorrectly declare itself the root and
++        # the next regular training forward then fails.  There is currently no
++        # public API for this initialization, so use the same pinned PyTorch
++        # state hook that the root pre-forward invokes.
++        model._get_fsdp_state()._lazy_init()
++        model.unshard()
++    try:
++        yield
++    finally:
++        if is_fsdp2:
++            model.reshard()
++
++
+ class _GenerationConfig(GenerationConfig):
+ 
+     def __repr__(self) -> str:
+@@ -416,7 +448,11 @@ class TransformersEngine(InferEngine):
+             generate_kwargs['adapter_names'] = adapter_names
+         num_prompt_tokens = self._get_num_tokens(inputs)
+         generate_kwargs = self.template.prepare_generate_kwargs(generate_kwargs, model=self.model)
+-        output = dict(self.template.generate(self.model, **generate_kwargs))
++        # Composite multimodal models such as Janus delegate generation to the
++        # language submodel. Keep root-owned final norm / LM-head parameters
++        # materialized while that delegated call runs under FSDP2.
++        with _manual_fsdp2_root_context(self.model):
++            output = dict(self.template.generate(self.model, **generate_kwargs))
+         output.pop('past_key_values', None)
+         batched_generate_ids = output['sequences']
+         batched_generate_ids = self.template.get_generate_ids(batched_generate_ids, num_prompt_tokens)
+@@ -507,8 +543,11 @@ class TransformersEngine(InferEngine):
+         else:
+             return await queue.get()
+ 
+-    # Ensure `template._post_encode` has no gradient.
+-    @torch.inference_mode()
++    # Ensure `template._post_encode` has no gradient.  Use ``no_grad`` rather
++    # than ``inference_mode`` because GRPO's Transformers rollout engine shares
++    # the FSDP2-wrapped policy with training.  FSDP all-gather buffers first
++    # allocated in inference mode cannot subsequently participate in autograd.
++    @torch.no_grad()
+     def _infer(
+         self,
+         infer_requests: List[InferRequest],
+@@ -531,7 +570,8 @@ class TransformersEngine(InferEngine):
+             inputs = to_device(self.template.data_collator(batched_inputs), self.model.device)
+             self.template.debug_logger(inputs)  # debug
+             if self.model_meta.is_multimodal:
+-                _, inputs = self.template.pre_forward_hook(self.model, None, inputs)
++                with _manual_fsdp2_root_context(self.model):
++                    _, inputs = self.template.pre_forward_hook(self.model, None, inputs)
+             if self.model_info.task_type == 'causal_lm':
+                 self.set_default_max_tokens(request_config, inputs)
+                 generation_config = self._prepare_generation_config(request_config)
+diff --git a/swift/rlhf_trainers/rollout_mixin.py b/swift/rlhf_trainers/rollout_mixin.py
+index d76ea43..56cb7a8 100644
+--- a/swift/rlhf_trainers/rollout_mixin.py
++++ b/swift/rlhf_trainers/rollout_mixin.py
+@@ -391,7 +391,18 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
+             infer_template.padding_free = False
+             infer_template.sequence_parallel_size = 1
+             infer_template.remove_unused_columns = True
+-            self.engine = TransformersEngine(self.model, template=infer_template, max_batch_size=0)
++            # The Transformers backend shares the training policy and therefore
++            # must also honor the local rollout forward limit.  In particular,
++            # multimodal generation batches can be much larger than the train
++            # micro-batch when steps_per_generation > 1.
++            rollout_batch_size = int(os.environ.get('SWIFT_TRANSFORMERS_ROLLOUT_BATCH_SIZE', '0'))
++            if rollout_batch_size < 0:
++                raise ValueError('SWIFT_TRANSFORMERS_ROLLOUT_BATCH_SIZE must be >= 0')
++            self.engine = TransformersEngine(
++                self.model,
++                template=infer_template,
++                max_batch_size=rollout_batch_size,
++            )
+             return
+ 
+         if not is_vllm_available():

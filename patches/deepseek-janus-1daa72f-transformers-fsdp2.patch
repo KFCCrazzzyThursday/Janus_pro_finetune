@@ -1,0 +1,27 @@
+diff --git a/janus/models/modeling_vlm.py b/janus/models/modeling_vlm.py
+index 8d23bc0..f2a2d5c 100644
+--- a/janus/models/modeling_vlm.py
++++ b/janus/models/modeling_vlm.py
+@@ -147,6 +147,9 @@ class GenHeadConfig(PretrainedConfig):
+ 
+ class MultiModalityConfig(PretrainedConfig):
+     model_type = "multi_modality"
++    # Transformers propagates the selected attention backend only through
++    # declared sub-configs.  Janus delegates all causal attention to Llama.
++    sub_configs = {"language_config": LlamaConfig}
+     vision_config: VisionConfig
+     aligner_config: AlignerConfig
+ 
+@@ -183,7 +186,11 @@ class MultiModalityConfig(PretrainedConfig):
+ class MultiModalityPreTrainedModel(PreTrainedModel):
+     config_class = MultiModalityConfig
+     base_model_prefix = "multi_modality"
+-    _no_split_modules = []
++    # The outer Janus wrapper contains no attention of its own; its language
++    # model is a stock Transformers Llama and therefore supports SDPA.  These
++    # declarations also give FSDP a safe transformer-layer wrapping boundary.
++    _supports_sdpa = True
++    _no_split_modules = ["LlamaDecoderLayer"]
+     _skip_keys_device_placement = "past_key_values"
+ 
+ 
