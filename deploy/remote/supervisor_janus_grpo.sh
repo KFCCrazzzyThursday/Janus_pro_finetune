@@ -8,4 +8,4 @@ utils=/opt/supervisor-scripts/utils
 . "${utils}/environment.sh"
 
 cd /workspace/Janus_pro_finetune
-exec pty /bin/bash /workspace/Janus_pro_finetune/deploy/remote/run_stage1_grpo.sh 2>&1
+pty /bin/bash /workspace/Janus_pro_finetune/deploy/remote/run_stage1_grpo.sh 2>&1
