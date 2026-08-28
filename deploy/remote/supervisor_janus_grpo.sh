@@ -3,7 +3,7 @@ set -euo pipefail
 
 utils=/opt/supervisor-scripts/utils
 # shellcheck disable=SC1091
-. "${utils}/logging.sh"
+. "${utils}/logging.sh" ""
 # shellcheck disable=SC1091
 . "${utils}/environment.sh"
 
