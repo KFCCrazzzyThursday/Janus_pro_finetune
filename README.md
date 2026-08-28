@@ -16,6 +16,11 @@ The paper settings and all identified ambiguities are recorded in
 `configs/paper.yaml` and `reproducibility/paper_audit.md`. Exact software and
 hardware versions are in `reproducibility/environment.md`.
 
+For the single-host `8 x A100-SXM4-40GB` deployment, see
+`deploy/local_a100/README.md`. Its validated profile is LoRA + 8-rank DDP with
+AdamW (GaLore disabled), launched and monitored in tmux. The measured run
+snapshot is in `docs/a100_lora_ddp_grpo_run.md`.
+
 Prepare data:
 
 ```bash
@@ -165,6 +170,14 @@ in the repository:
 ```bash
 export OPENAI_API_KEY='...'
 bash scripts/run_stage1_grpo.sh
+```
+
+On the local A100 host, prefer the tmux helper. It reads the key silently and
+does not embed it in the pane command or a file:
+
+```bash
+bash deploy/local_a100/start_grpo_tmux.sh
+bash deploy/local_a100/start_tensorboard_tmux.sh
 ```
 
 Generate one CoT for every TQA training item and run the auditable automatic

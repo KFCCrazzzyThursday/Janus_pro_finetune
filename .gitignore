@@ -15,3 +15,7 @@ logs/
 wandb/
 *.log
 core
+core.*
+.env
+.env.*
+*.secret.env

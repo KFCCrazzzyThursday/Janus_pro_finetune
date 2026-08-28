@@ -221,7 +221,8 @@ def main() -> None:
                 "difficulty_fallback_used": fallback_used,
                 "difficulty_error": error,
                 "difficulty_method": (
-                    f"janus-pro-7b base; decoding={args.decoding}; "
+                    f"janus-pro-7b checkpoint={args.model_source.name}; "
+                    f"decoding={args.decoding}; "
                     "see janus_repro.difficulty.DIFFICULTY_SYSTEM_PROMPT"
                 ),
             }

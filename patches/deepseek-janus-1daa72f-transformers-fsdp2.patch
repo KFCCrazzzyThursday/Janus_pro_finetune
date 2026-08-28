@@ -1,5 +1,5 @@
 diff --git a/janus/models/modeling_vlm.py b/janus/models/modeling_vlm.py
-index 8d23bc0..f2a2d5c 100644
+index 8d23bc0..4a30d88 100644
 --- a/janus/models/modeling_vlm.py
 +++ b/janus/models/modeling_vlm.py
 @@ -147,6 +147,9 @@ class GenHeadConfig(PretrainedConfig):
@@ -25,3 +25,36 @@ index 8d23bc0..f2a2d5c 100644
      _skip_keys_device_placement = "past_key_values"
  
  
+@@ -221,3 +228,32 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
++    # Expose the nested language embeddings through the standard Transformers
++    # interface. Besides making weight tying/resizing work as expected, this
++    # lets FSDP carve the large embedding/head out of the multimodal root group.
++    def get_input_embeddings(self):
++        return self.language_model.get_input_embeddings()
++
++    def set_input_embeddings(self, value):
++        self.language_model.set_input_embeddings(value)
++
++    def get_output_embeddings(self):
++        return self.language_model.get_output_embeddings()
++
++    def set_output_embeddings(self, value):
++        self.language_model.set_output_embeddings(value)
++
++    def tie_weights(self):
++        """Preserve the nested Llama weight-tying policy.
++
++        ``MultiModalityConfig`` inherits Transformers' default
++        ``tie_word_embeddings=True``, while Janus' nested ``LlamaConfig`` uses
++        ``False``. Delegating here prevents CPU-efficient FSDP loading from
++        temporarily aliasing the distinct input embedding and LM head.
++        """
++        return self.language_model.tie_weights()
++
++    def prepare_inputs_for_generation(self, *args, **kwargs):
++        """Expose the nested causal LM generation hook for PEFT/LoRA."""
++        return self.language_model.prepare_inputs_for_generation(*args, **kwargs)
++
+     def prepare_inputs_embeds(
+         self,
+         input_ids: torch.LongTensor,

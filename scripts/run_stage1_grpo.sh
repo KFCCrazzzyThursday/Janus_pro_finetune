@@ -7,6 +7,7 @@ BASE_MODEL_DIR="${JANUS_MODEL_DIR:-${ROOT_DIR}/models/Janus-Pro-7B}"
 GRPO_DATASET="${JANUS_STAGE1_GRPO_DATA:-${ROOT_DIR}/data/processed/tqa/train_prompt_model_difficulty.jsonl}"
 SMOKE=0
 MEMORY_SMOKE=0
+OFFLINE_JUDGE_STUB="${JANUS_OFFLINE_JUDGE_STUB:-0}"
 
 if [[ "${1:-}" == "--smoke" ]]; then
   SMOKE=1
@@ -47,8 +48,12 @@ if [[ -z "${MODEL_SOURCE_DIR}" ]]; then
   fi
 fi
 
-if (( SMOKE || MEMORY_SMOKE )); then
+if (( SMOKE || MEMORY_SMOKE )) || [[ "${OFFLINE_JUDGE_STUB}" == "1" ]]; then
   export JANUS_REASONING_JUDGE_SMOKE_STUB=1
+  if [[ "${OFFLINE_JUDGE_STUB}" == "1" ]] && (( ! SMOKE && ! MEMORY_SMOKE )); then
+    echo "WARNING: JANUS_OFFLINE_JUDGE_STUB=1; reasoning reward is fixed to zero." >&2
+    echo "This is an offline GRPO ablation, not the formal four-reward experiment." >&2
+  fi
 else
   unset JANUS_REASONING_JUDGE_SMOKE_STUB
   if [[ -z "${OPENAI_API_KEY:-}" ]]; then
@@ -98,7 +103,14 @@ export JANUS_ADVANTAGE_THRESHOLD="${JANUS_ADVANTAGE_THRESHOLD:-0.2}"
 # Transformers-engine chunk limit directly through the process environment.
 export SWIFT_TRANSFORMERS_ROLLOUT_BATCH_SIZE="${JANUS_LOCAL_ROLLOUT_FORWARD_BATCH_SIZE:-1}"
 
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+if [[ "${JANUS_KEEP_HTTP_PROXY:-0}" == "1" ]]; then
+  # This host reaches the external judge through its HTTP(S) proxy.  Avoid the
+  # SOCKS fallback because the pinned httpx environment intentionally omits
+  # the optional socksio dependency.
+  unset ALL_PROXY all_proxy
+else
+  unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+fi
 
 COMMON_ARGS=(
   --rlhf_type grpo
@@ -116,7 +128,11 @@ COMMON_ARGS=(
     "${ROOT_DIR}/training/plugins/scienceqa_grpo.py"
   --reward_funcs janus_accuracy janus_length janus_format janus_reasoning
   --reward_weights 1 1 1 1
-  --tuner_type full
+  --tuner_type "${JANUS_TUNER_TYPE:-lora}"
+  --target_modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj
+  --lora_rank "${JANUS_LORA_RANK:-32}"
+  --lora_alpha "${JANUS_LORA_ALPHA:-64}"
+  --lora_dropout "${JANUS_LORA_DROPOUT:-0.05}"
   --freeze_llm false
   --freeze_vit true
   --freeze_aligner true
@@ -130,30 +146,27 @@ COMMON_ARGS=(
   --temperature 1.0
   --top_p 1.0
   --num_generations "${JANUS_GRPO_NUM_GENERATIONS:-16}"
-  # Four 46 GiB L40S cards need a one-sample multimodal micro-batch.  Doubling
-  # accumulation and steps_per_generation preserves the paper's 128-completion
-  # effective batch and one rollout batch per optimizer step.
+  # Deployment launchers override these values while preserving 128 generated
+  # completions per optimizer update. The defaults describe the four-rank
+  # low-memory profile; the A100 launcher uses eight ranks and GA/SPG=16.
   --per_device_train_batch_size "${JANUS_GRPO_PER_DEVICE_BATCH:-1}"
   --gradient_accumulation_steps "${JANUS_GRPO_GRAD_ACCUM:-32}"
   --generation_batch_size "${JANUS_GRPO_GENERATION_BATCH:-128}"
   --steps_per_generation "${JANUS_GRPO_STEPS_PER_GENERATION:-32}"
-  # The local rollout contains 32 image/completion records. Generate them in
-  # bounded chunks so 384-token KV caches do not contend with the FSDP shards.
+  # TransformersEngine uses SWIFT_TRANSFORMERS_ROLLOUT_BATCH_SIZE above to
+  # bound generation KV-cache memory independently of the training microbatch.
   --gradient_checkpointing true
   --gradient_checkpointing_kwargs '{"use_reentrant": false}'
   --vit_gradient_checkpointing false
-  --learning_rate 1e-6
+  --learning_rate "${JANUS_GRPO_LEARNING_RATE:-1e-5}"
   --lr_scheduler_type constant
   --warmup_ratio 0
   --weight_decay 0
   --max_grad_norm 1
   --adam_beta1 0.9
   --adam_beta2 0.95
-  --use_galore true
-  --galore_target_modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj
-  --galore_rank 512
-  --galore_update_proj_gap 128
-  --galore_optim_per_parameter false
+  --optim "${JANUS_OPTIM:-adamw_torch}"
+  --use_galore false
   --ddp_find_unused_parameters false
   --loss_type dapo
   --epsilon 0.2
@@ -187,10 +200,11 @@ COMMON_ARGS=(
   --output_dir "${OUTPUT_DIR}"
 )
 
-GRPO_BACKEND="${JANUS_GRPO_BACKEND:-fsdp2}"
+GRPO_BACKEND="${JANUS_GRPO_BACKEND:-ddp}"
 case "${GRPO_BACKEND}" in
   fsdp2)
-    COMMON_ARGS+=(--fsdp "${ROOT_DIR}/configs/fsdp2_galore.json")
+    FSDP_CONFIG="${JANUS_FSDP_CONFIG:-${ROOT_DIR}/configs/fsdp2_galore.json}"
+    COMMON_ARGS+=(--fsdp "${FSDP_CONFIG}")
     ;;
   ddp)
     ;;

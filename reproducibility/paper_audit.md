@@ -99,6 +99,20 @@ score as an exact match by construction.
   eight completions. This interpretation makes 3,000 updates approximately
   consistent with approximately four passes over the 6,501-prompt data plus
   dynamic resamples.
+
+## Current A100 systems profile versus the paper
+
+The active `deploy/local_a100` profile is an explicit systems adaptation, not
+an optimizer-exact reproduction of the thesis. At the user's direction it uses
+LoRA r=32 with AdamW at LR 1e-5 and disables GaLore; the thesis reports
+full-parameter GaLore at LR 1e-6. It preserves the paper-shaped eight prompts
+and 128 completions per optimizer update, G=16, DAPO clipping, dynamic reward
+logic, completion cap, seeds, and 3,000-step schedule.
+
+This distinction is recorded in launcher output, the A100 runbook, and the
+environment report so LoRA results are not mislabeled as a numerically exact
+paper reproduction. The original hyperparameters remain unchanged in
+`configs/paper.yaml`.
 - vLLM is not used in the L40S launcher because the thesis depends on an
   unpublished modified vLLM/TRL implementation and stock ms-swift does not
   provide a verified Janus multimodal vLLM path. Rollouts use Transformers;

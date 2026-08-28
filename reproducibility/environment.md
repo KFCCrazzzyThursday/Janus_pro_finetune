@@ -1,5 +1,7 @@
 # Reproduction environment
 
+## Original L40S full-tuning profile
+
 - Date: 2026-08-27 (UTC)
 - Host Python: 3.12.3, GCC 13.3.0
 - Virtual environment: `/root/.venvs/janus-repro-py312`
@@ -60,6 +62,38 @@ Python virtual environment normally lives. Model weights, datasets,
 checkpoints, logs, predictions, TensorBoard events, and telemetry CSV files are
 canonical on NFS. GPU jobs use the NFS model directly and do not keep a local
 or `/dev/shm` checkpoint copy.
+
+## Local A100 LoRA profile (current validated run)
+
+- Date validated: 2026-08-29 (UTC)
+- GPUs: 8 x NVIDIA A100-SXM4-40GB on one NVLink host
+- Host RAM: 251 GiB plus 63 GiB swap
+- Python: 3.12
+- PyTorch: 2.6.0+cu124; torchvision: 0.21.0+cu124
+- transformers: 4.57.6; TRL: 0.29.1; PEFT: 0.20.0
+- accelerate: 1.14.0; TensorBoard: 2.21.0
+- Model: downloaded stage-1 SFT checkpoint from
+  `Billyshears/Janus_pro_finetune`
+- Dataset: 6,501 TQA prompts with model difficulty annotations
+- Parallelism: 8-rank DDP, BF16, SDPA, Transformers rollout
+- Tuning: LoRA r=32/alpha=64/dropout=0.05; 74.9568M trainable parameters
+- Optimizer: AdamW, LR 1e-5; GaLore explicitly disabled
+- Batch: per-device 1, gradient accumulation 16, generation batch 128,
+  steps-per-generation 16, G=16, rollout chunk 4
+- Observed peak trainer memory: 21.6 GiB/rank
+- First 26-step mean compute time: 124.65 s/step; observed wall-clock mean
+  approximately 138.4 s/step
+- Process supervision: GRPO and TensorBoard run in separate tmux sessions
+
+The Janus upstream patch exposes nested input/output embeddings, delegates
+weight tying to the nested Llama configuration, and delegates
+`prepare_inputs_for_generation`. The latter is required for PEFT's causal-LM
+wrapper. The ms-swift patch bounds Transformers rollout batch size and avoids
+forking dataset preprocessing when `num_proc=1`.
+
+See `docs/a100_lora_ddp_grpo_run.md` and `deploy/local_a100/README.md` for the
+exact runbook. The older L40S and Blackwell sections remain historical profiles
+and do not describe the local A100 launcher's defaults.
 
 ## Blackwell migration target
 

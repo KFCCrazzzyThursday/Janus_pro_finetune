@@ -21,6 +21,27 @@ index 6970e95..520398d 100644
      if isinstance(dataset, HfIterableDataset):
          return dataset.map(lambda example: {**example, 'dataset': ds_name})
      return dataset.add_column('dataset', [ds_name] * len(dataset))
+diff --git a/swift/dataset/preprocessor/core.py b/swift/dataset/preprocessor/core.py
+index 3333b2bd..fc6b4ee9 100644
+--- a/swift/dataset/preprocessor/core.py
++++ b/swift/dataset/preprocessor/core.py
+@@ -326,10 +326,12 @@ class RowPreprocessor:
+         if isinstance(dataset, HfDataset):
+             if not load_from_cache_file and is_dist() and not is_master():
+                 load_from_cache_file = True
+-            map_kwargs.update({
+-                'num_proc': num_proc,
+-                'load_from_cache_file': load_from_cache_file,
+-            })
++            map_kwargs['load_from_cache_file'] = load_from_cache_file
++            # datasets.map(num_proc=1) still creates a multiprocessing Manager
++            # and forks.  Run truly in-process for one worker; this is critical
++            # when distributed ranks have already loaded large model weights.
++            if num_proc is not None and num_proc > 1:
++                map_kwargs['num_proc'] = num_proc
+         # compat GRPO: The solution field will be retained.
+         dataset = RowPreprocessor.get_features_dataset(dataset)
+         if 'solution' in dataset.features:
 diff --git a/swift/infer_engine/transformers_engine.py b/swift/infer_engine/transformers_engine.py
 index f84634a..aeb1a94 100644
 --- a/swift/infer_engine/transformers_engine.py
@@ -114,6 +135,47 @@ index f84634a..aeb1a94 100644
              if self.model_info.task_type == 'causal_lm':
                  self.set_default_max_tokens(request_config, inputs)
                  generation_config = self._prepare_generation_config(request_config)
+diff --git a/swift/pipelines/train/rlhf.py b/swift/pipelines/train/rlhf.py
+index edc58251..5c93271a 100644
+--- a/swift/pipelines/train/rlhf.py
++++ b/swift/pipelines/train/rlhf.py
+@@ -91,10 +91,28 @@ class SwiftRLHF(SwiftSft):
+                 context = disable_deepspeed_zero3()
+-        with context:
+-            model, processor = args.get_model_processor(
+-                model=model_id_or_path,
+-                model_type=model_type,
+-                revision=model_revision,
+-                task_type=task_type,
+-                num_labels=num_labels)
++        # Accelerate's FSDP2 CPU-RAM-efficient loading is ideal for the
++        # trainable policy, but its rank-0 state broadcast cannot currently
++        # prepare a fully frozen Janus reference model on torch 2.6.  Allow a
++        # deployment to load that BF16 reference normally on every rank while
++        # restoring the efficient-loading setting before the policy is loaded.
++        load_ref_on_all_ranks = (
++            origin_key == 'ref' and os.environ.get('SWIFT_FSDP2_LOAD_REF_ON_ALL_RANKS') == '1')
++        fsdp_cpu_ram_env = 'FSDP_CPU_RAM_EFFICIENT_LOADING'
++        previous_fsdp_cpu_ram = os.environ.get(fsdp_cpu_ram_env)
++        if load_ref_on_all_ranks:
++            os.environ[fsdp_cpu_ram_env] = 'False'
++        try:
++            with context:
++                model, processor = args.get_model_processor(
++                    model=model_id_or_path,
++                    model_type=model_type,
++                    revision=model_revision,
++                    task_type=task_type,
++                    num_labels=num_labels)
++        finally:
++            if load_ref_on_all_ranks:
++                if previous_fsdp_cpu_ram is None:
++                    os.environ.pop(fsdp_cpu_ram_env, None)
++                else:
++                    os.environ[fsdp_cpu_ram_env] = previous_fsdp_cpu_ram
+-
++
+         adapters = args.adapters if key == 'ref' else args.reward_adapters
 diff --git a/swift/rlhf_trainers/rollout_mixin.py b/swift/rlhf_trainers/rollout_mixin.py
 index d76ea43..56cb7a8 100644
 --- a/swift/rlhf_trainers/rollout_mixin.py
