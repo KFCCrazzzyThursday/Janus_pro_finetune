@@ -6,6 +6,7 @@ einops==0.8.2
 hf-xet==1.6.0
 huggingface-hub==0.36.2
 modelscope==1.39.1
+msgspec==0.21.1
 numpy==2.5.2
 openai==3.5.0
 pandas==2.3.3
