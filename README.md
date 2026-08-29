@@ -1,8 +1,8 @@
 # Janus-Pro thesis reproduction
 
-This repository reproduces the experiments in `final_print.pdf`. The first
-run used physical L40S GPUs `0,1,3,4`; the current deployment also supports
-four RTX PRO 6000 Blackwell 96 GB GPUs as logical devices `0,1,2,3`. Raw
+This repository reproduces the experiments in `final_print.pdf`. The local
+GRPO run uses physical L40S GPUs `0,1,2,3,4`; the remote deployment also
+supports four RTX PRO 6000 Blackwell 96 GB GPUs as logical devices `0,1,2,3`. Raw
 datasets, model weights, credentials, caches, and generated outputs are
 intentionally excluded from Git.
 
@@ -14,7 +14,9 @@ Current pinned upstream revisions:
 
 The paper settings and all identified ambiguities are recorded in
 `configs/paper.yaml` and `reproducibility/paper_audit.md`. Exact software and
-hardware versions are in `reproducibility/environment.md`.
+hardware versions are in `reproducibility/environment.md`. The stabilized
+reward formula, paper-mode ablation, sparse-judge correction, and monitoring
+definitions are documented in `docs/reward_variance_weighting_revision.md`.
 
 Prepare data:
 
@@ -22,18 +24,20 @@ Prepare data:
 /root/.venvs/janus-repro-py312/bin/python scripts/prepare_data.py
 ```
 
-GPU launchers default to the original L40S device list and allow a deployment
+GPU launchers default to the five-card local L40S device list and allow a deployment
 to override it explicitly:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,3,4 ...
+JANUS_CUDA_VISIBLE_DEVICES=0,1,2,3,4 JANUS_NPROC_PER_NODE=5 ...
 ```
 
 On the original host, the canonical checkpoint, datasets, logs, and experiment
 outputs stay on NFS. GPU launchers read that model directly by default
 (`JANUS_STAGE_MODEL_TO_RAM=0`). Optional RAM staging checks both available host
-RAM and tmpfs capacity before copying, and keeps a configurable 64 GiB safety
-margin.
+RAM and tmpfs capacity before copying. GRPO starts a separate memory guard
+before importing PyTorch; it terminates the complete launcher process group if
+used RAM reaches 115 GiB or swap reaches 0.25 GiB. Smoke tests use a stricter
+100 GiB threshold.
 
 ## Clean Blackwell deployment
 
@@ -106,9 +110,22 @@ Reasoning reward means/variances. Extra GRPO diagnostics include component
 contributions, dynamic reward weights, correct/strict-format/reasoning-active
 fractions, retained groups and advantages, KL and its scheduled coefficient,
 entropy, low/high clipping ratios, completion length/truncation, and rollout
-throughput. A separate resource run records physical GPUs 0, 1, 3, and 4
+throughput. A separate resource run records physical GPUs 0, 1, 2, 3, and 4
 (memory, utilization, power, temperature) plus host RAM, swap, and load to both
-TensorBoard and `resource_metrics.csv`; physical GPU 2 is never sampled.
+TensorBoard and `resource_metrics.csv`.
+
+The active GRPO run uses a stabilized form of the paper's adaptive weighting.
+For component `i`, it computes the prompt-local standard deviation after
+dividing by the theoretical reward range, forms
+`q_i = beta_i * std_i / sum_j(beta_j * std_j)`, and uses
+`w_i = (1-rho) * beta_i + rho * q_i` with `rho=0.5`. This caps the cubic
+variance-amplification effect and leaves every component a beta-derived floor.
+Reasoning judges 8 of each 16 candidates by default; only those eight scores
+estimate its standard deviation, while mean-imputed scores remain available to
+form dense rewards. All-wrong groups are retained for reasoning/length/format
+learning signal, while all-correct groups are treated as mastered and
+resampled. TensorBoard separately logs judged fraction, normalized component
+standard deviations, and all-wrong/mixed/mastered group fractions.
 
 The optimized and original-GRPO ablation runs use separate run directories so
 TensorBoard can overlay their 3,000-step reward curves for Figure 5.1.
@@ -158,12 +175,29 @@ bash scripts/run_annotate_tqa_difficulty.sh
 bash scripts/run_stage1_grpo.sh --smoke
 ```
 
-The real GRPO run uses the configured DeepSeek replacement for the paper's
-retired external judge. Export the key in the calling shell without storing it
-in the repository:
+The real GRPO run uses five-card DDP with rank-16 LoRA on the seven Llama
+attention/MLP projections. Its configured DeepSeek service replaces the
+paper's retired external judge. Export the key in the calling shell without
+storing it in the repository:
 
 ```bash
 export OPENAI_API_KEY='...'
+bash scripts/run_stage1_grpo.sh
+```
+
+The default local rollout forward batch is 4. A full-shape L40S preflight used
+at most 29.6 GiB per GPU and 14.9 GiB host RAM. To resume explicitly after an
+interruption:
+
+The reasoning judge first removes answer-homogeneous groups that DAPO would
+discard, uses a shared exact SQLite cache, and issues the appendix-compatible
+single-candidate prompt with concurrency 16.  Candidate batching, prompt
+truncation, 50% score sampling, and the stricter 0.625 activation threshold are
+available through `JANUS_JUDGE_*` environment variables but are off by default
+because they change judge outputs or reward semantics.
+
+```bash
+export JANUS_RESUME_FROM_CHECKPOINT=/root/nfs/LiYJ/Janus/outputs/stage1/tqa_grpo_lora/checkpoint-500
 bash scripts/run_stage1_grpo.sh
 ```
 

@@ -17,11 +17,11 @@ elif [[ "${1:-}" == "--memory-smoke" ]]; then
 fi
 
 if (( SMOKE )); then
-  OUTPUT_DIR="${JANUS_STAGE1_GRPO_OUTPUT:-${ROOT_DIR}/outputs/smoke/stage1_tqa_grpo}"
+  OUTPUT_DIR="${JANUS_STAGE1_GRPO_OUTPUT:-${ROOT_DIR}/outputs/smoke/stage1_tqa_grpo_lora}"
 elif (( MEMORY_SMOKE )); then
-  OUTPUT_DIR="${JANUS_STAGE1_GRPO_OUTPUT:-${ROOT_DIR}/outputs/smoke/stage1_tqa_grpo_full_shape}"
+  OUTPUT_DIR="${JANUS_STAGE1_GRPO_OUTPUT:-${ROOT_DIR}/outputs/smoke/stage1_tqa_grpo_lora_full_shape}"
 else
-  OUTPUT_DIR="${JANUS_STAGE1_GRPO_OUTPUT:-${ROOT_DIR}/outputs/stage1/tqa_grpo}"
+  OUTPUT_DIR="${JANUS_STAGE1_GRPO_OUTPUT:-${ROOT_DIR}/outputs/stage1/tqa_grpo_lora}"
 fi
 
 if [[ ! -s "${GRPO_DATASET}" ]]; then
@@ -31,8 +31,20 @@ if [[ ! -s "${GRPO_DATASET}" ]]; then
 fi
 
 latest_sft_checkpoint() {
-  find "${ROOT_DIR}/outputs/stage1/scienceqa_sft" -maxdepth 1 -type d \
-    -name 'checkpoint-*' -print 2>/dev/null | sort -V | tail -n 1
+  local checkpoint_root="${ROOT_DIR}/outputs/stage1/scienceqa_sft"
+  local checkpoint
+
+  # The validated BF16 export is sharded and half the size of the legacy FP32
+  # single-file export. Prefer it to keep NFS traffic and host RAM bounded.
+  checkpoint="$(find "${checkpoint_root}" -maxdepth 1 -type d \
+    -name 'checkpoint-*-bf16' -print 2>/dev/null | sort -V | tail -n 1)"
+  if [[ -n "${checkpoint}" ]]; then
+    echo "${checkpoint}"
+    return
+  fi
+
+  find "${checkpoint_root}" -maxdepth 1 -type d \
+    -name 'checkpoint-*' ! -name 'checkpoint-*-hf' -print 2>/dev/null | sort -V | tail -n 1
 }
 
 MODEL_SOURCE_DIR="${JANUS_STAGE1_SFT_MODEL:-$(latest_sft_checkpoint)}"
@@ -67,8 +79,8 @@ else
 fi
 janus_stage_model_to_ram "${MODEL_SOURCE_DIR}"
 
-export CUDA_VISIBLE_DEVICES="${JANUS_CUDA_VISIBLE_DEVICES:-0,1,3,4}"
-export NPROC_PER_NODE="${JANUS_NPROC_PER_NODE:-4}"
+export CUDA_VISIBLE_DEVICES="${JANUS_CUDA_VISIBLE_DEVICES:-0,1,2,3,4}"
+export NPROC_PER_NODE="${JANUS_NPROC_PER_NODE:-5}"
 export HF_HOME="${HF_HOME:-/root/nfs/hf_cache}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -77,16 +89,94 @@ export JANUS_MODEL_DIR="${JANUS_ACTIVE_MODEL_DIR}"
 export JANUS_JUDGE_LOG_DIR="${OUTPUT_DIR}/judge_calls"
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.deepseek.com}"
 export JANUS_REASONING_JUDGE_MODEL="${JANUS_REASONING_JUDGE_MODEL:-deepseek-v4-flash-vision-exp}"
+# Judge optimizations ported from the H200 experiments.  Exact caching,
+# pre-filtering groups that DAPO will discard, and higher request concurrency
+# cut latency without approximating unscored candidates.  On this host,
+# individual requests were faster and matched the appendix prompt exactly.
+# Judge half of each G=16 group; the plugin tracks that observation mask so
+# mean-imputed candidates no longer suppress the measured reasoning variance.
+export JANUS_JUDGE_CACHE="${JANUS_JUDGE_CACHE:-1}"
+export JANUS_JUDGE_CACHE_PATH="${JANUS_JUDGE_CACHE_PATH:-${ROOT_DIR}/outputs/judge_cache.sqlite3}"
+export JANUS_JUDGE_BATCH_SIZE="${JANUS_JUDGE_BATCH_SIZE:-1}"
+# DeepSeek applies one account-wide concurrency limit, while this value is
+# per DDP rank. One request per rank keeps five-rank training below the current
+# account limit of eight without requiring a cross-process semaphore.
+export JANUS_JUDGE_CONCURRENCY="${JANUS_JUDGE_CONCURRENCY:-1}"
+export JANUS_JUDGE_MAX_ATTEMPTS="${JANUS_JUDGE_MAX_ATTEMPTS:-5}"
+# Keep retrying HTTP 429 with capped exponential backoff. Zero means unlimited;
+# preserving the in-memory optimizer state is safer than aborting between saves.
+export JANUS_JUDGE_RATE_LIMIT_MAX_ATTEMPTS="${JANUS_JUDGE_RATE_LIMIT_MAX_ATTEMPTS:-0}"
+export JANUS_JUDGE_RATE_LIMIT_BASE_DELAY="${JANUS_JUDGE_RATE_LIMIT_BASE_DELAY:-5}"
+export JANUS_JUDGE_RATE_LIMIT_MAX_DELAY="${JANUS_JUDGE_RATE_LIMIT_MAX_DELAY:-60}"
+export JANUS_JUDGE_COMPACT_PROMPT="${JANUS_JUDGE_COMPACT_PROMPT:-0}"
+export JANUS_JUDGE_MAX_REASONING_CHARS="${JANUS_JUDGE_MAX_REASONING_CHARS:-0}"
+export JANUS_JUDGE_SAMPLE_FRACTION="${JANUS_JUDGE_SAMPLE_FRACTION:-0.5}"
+export JANUS_JUDGE_ACTIVATION_MODE="${JANUS_JUDGE_ACTIVATION_MODE:-all_non_mastered}"
+export JANUS_JUDGE_ACTIVATION_THRESHOLD="${JANUS_JUDGE_ACTIVATION_THRESHOLD:-0.60}"
+export JANUS_JUDGE_SKIP_HOMOGENEOUS="${JANUS_JUDGE_SKIP_HOMOGENEOUS:-1}"
+export JANUS_JUDGE_PRESAMPLE_FILTER="${JANUS_JUDGE_PRESAMPLE_FILTER:-1}"
+export JANUS_JUDGE_PROMPT_VERSION="${JANUS_JUDGE_PROMPT_VERSION:-paper-batch-v1}"
 export JANUS_REWARD_PRIOR="${JANUS_REWARD_PRIOR:-table}"
+# Preserve the paper formula as an explicit ablation, but make the corrected
+# range-normalized standard-deviation weighting unambiguous for this L40S run.
+export JANUS_REWARD_WEIGHTING="${JANUS_REWARD_WEIGHTING:-stabilized}"
+export JANUS_REWARD_VARIANCE_MIX="${JANUS_REWARD_VARIANCE_MIX:-${JANUS_REWARD_DYNAMIC_MIX:-0.5}}"
+# Backward-compatible metric/config alias used by earlier local runs.
+export JANUS_REWARD_DYNAMIC_MIX="${JANUS_REWARD_VARIANCE_MIX}"
 export JANUS_REWARD_DECAY_LAMBDA="${JANUS_REWARD_DECAY_LAMBDA:-0.00006666666666666667}"
 export JANUS_KL_DECAY_STEPS="${JANUS_KL_DECAY_STEPS:-500}"
 export JANUS_ADVANTAGE_THRESHOLD="${JANUS_ADVANTAGE_THRESHOLD:-0.2}"
 # ms-swift's outer RLHF arguments expose local_rollout_forward_batch_size,
 # but its internal TRL GRPOConfig currently drops that field. Pass the
 # Transformers-engine chunk limit directly through the process environment.
-export SWIFT_TRANSFORMERS_ROLLOUT_BATCH_SIZE="${JANUS_LOCAL_ROLLOUT_FORWARD_BATCH_SIZE:-1}"
+export SWIFT_TRANSFORMERS_ROLLOUT_BATCH_SIZE="${JANUS_LOCAL_ROLLOUT_FORWARD_BATCH_SIZE:-4}"
+
+GRPO_PER_DEVICE_BATCH="${JANUS_GRPO_PER_DEVICE_BATCH:-1}"
+GRPO_STEPS_PER_GENERATION="${JANUS_GRPO_STEPS_PER_GENERATION:-32}"
+GRPO_GENERATION_BATCH_DEFAULT="$((NPROC_PER_NODE * GRPO_PER_DEVICE_BATCH * GRPO_STEPS_PER_GENERATION))"
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+
+# This host has GPUs 0/1/2 attached to NUMA node 0 and GPUs 3/4 attached to
+# node 1. Give every rank a non-overlapping set of physical cores plus their
+# SMT siblings. The external plugin applies these settings before model load;
+# memory placement is preferred (fallback allowed), never a hard membind.
+if [[ "${JANUS_NUMA_AFFINITY:-1}" == "1" ]]; then
+  IFS=',' read -r -a JANUS_PHYSICAL_GPU_ARRAY <<<"${CUDA_VISIBLE_DEVICES}"
+  JANUS_NUMA_CPUSET_LIST=()
+  JANUS_NUMA_NODE_LIST=()
+  for physical_gpu in "${JANUS_PHYSICAL_GPU_ARRAY[@]}"; do
+    case "${physical_gpu}" in
+      0) JANUS_NUMA_CPUSET_LIST+=("0-15,96-111"); JANUS_NUMA_NODE_LIST+=("0") ;;
+      1) JANUS_NUMA_CPUSET_LIST+=("16-31,112-127"); JANUS_NUMA_NODE_LIST+=("0") ;;
+      2) JANUS_NUMA_CPUSET_LIST+=("32-47,128-143"); JANUS_NUMA_NODE_LIST+=("0") ;;
+      3) JANUS_NUMA_CPUSET_LIST+=("48-71,144-167"); JANUS_NUMA_NODE_LIST+=("1") ;;
+      4) JANUS_NUMA_CPUSET_LIST+=("72-95,168-191"); JANUS_NUMA_NODE_LIST+=("1") ;;
+      *)
+        echo "No verified NUMA mapping for physical GPU ${physical_gpu}; set JANUS_NUMA_AFFINITY=0 or provide explicit mappings." >&2
+        exit 2
+        ;;
+    esac
+  done
+  if (( ${#JANUS_PHYSICAL_GPU_ARRAY[@]} != NPROC_PER_NODE )); then
+    echo "NPROC_PER_NODE=${NPROC_PER_NODE} does not match CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}." >&2
+    exit 2
+  fi
+  export JANUS_NUMA_CPUSETS="$(IFS=';'; echo "${JANUS_NUMA_CPUSET_LIST[*]}")"
+  export JANUS_NUMA_NODES="$(IFS=','; echo "${JANUS_NUMA_NODE_LIST[*]}")"
+else
+  unset JANUS_NUMA_CPUSETS JANUS_NUMA_NODES
+fi
+
+GRPO_BACKEND="${JANUS_GRPO_BACKEND:-ddp}"
+EXTERNAL_PLUGINS=(
+  "${ROOT_DIR}/training/plugins/numa_affinity.py"
+  "${ROOT_DIR}/training/plugins/janus_lora_compat.py"
+  "${ROOT_DIR}/training/plugins/scienceqa_grpo.py"
+)
+if [[ "${GRPO_BACKEND}" == "fsdp2" ]]; then
+  EXTERNAL_PLUGINS+=("${ROOT_DIR}/training/plugins/fsdp2_janus_compat.py")
+fi
 
 COMMON_ARGS=(
   --rlhf_type grpo
@@ -99,12 +189,14 @@ COMMON_ARGS=(
   --split_dataset_ratio 0
   --dataset_num_proc "${JANUS_GRPO_DATASET_NUM_PROC:-4}"
   --dataloader_num_workers "${JANUS_GRPO_DATALOADER_WORKERS:-2}"
-  --external_plugins \
-    "${ROOT_DIR}/training/plugins/fsdp2_janus_compat.py" \
-    "${ROOT_DIR}/training/plugins/scienceqa_grpo.py"
+  --external_plugins "${EXTERNAL_PLUGINS[@]}"
   --reward_funcs janus_accuracy janus_length janus_format janus_reasoning
   --reward_weights 1 1 1 1
-  --tuner_type full
+  --tuner_type lora
+  --target_modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj
+  --lora_rank "${JANUS_LORA_RANK:-16}"
+  --lora_alpha "${JANUS_LORA_ALPHA:-32}"
+  --lora_dropout "${JANUS_LORA_DROPOUT:-0.05}"
   --freeze_llm false
   --freeze_vit true
   --freeze_aligner true
@@ -118,15 +210,16 @@ COMMON_ARGS=(
   --temperature 1.0
   --top_p 1.0
   --num_generations "${JANUS_GRPO_NUM_GENERATIONS:-16}"
-  # Four 46 GiB L40S cards need a one-sample multimodal micro-batch.  Doubling
-  # accumulation and steps_per_generation preserves the paper's 128-completion
-  # effective batch and one rollout batch per optimizer step.
-  --per_device_train_batch_size "${JANUS_GRPO_PER_DEVICE_BATCH:-1}"
+  # L40S cards need a one-sample multimodal micro-batch. The default generation
+  # batch is derived from world size so TRL's batch invariant remains exact.
+  # Four ranks reproduce the paper's 128 completions; five ranks use 160 as an
+  # explicit local-hardware adaptation while preserving 32 samples per rank.
+  --per_device_train_batch_size "${GRPO_PER_DEVICE_BATCH}"
   --gradient_accumulation_steps "${JANUS_GRPO_GRAD_ACCUM:-32}"
-  --generation_batch_size "${JANUS_GRPO_GENERATION_BATCH:-128}"
-  --steps_per_generation "${JANUS_GRPO_STEPS_PER_GENERATION:-32}"
-  # The local rollout contains 32 image/completion records. Generate them in
-  # bounded chunks so 384-token KV caches do not contend with the FSDP shards.
+  --generation_batch_size "${JANUS_GRPO_GENERATION_BATCH:-${GRPO_GENERATION_BATCH_DEFAULT}}"
+  --steps_per_generation "${GRPO_STEPS_PER_GENERATION}"
+  # Generate each rank's local rollout in bounded chunks so the multimodal
+  # activations and 384-token KV caches remain below one L40S's 48 GiB limit.
   --gradient_checkpointing true
   --gradient_checkpointing_kwargs '{"use_reentrant": false}'
   --vit_gradient_checkpointing false
@@ -137,11 +230,7 @@ COMMON_ARGS=(
   --max_grad_norm 1
   --adam_beta1 0.9
   --adam_beta2 0.95
-  --use_galore true
-  --galore_target_modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj
-  --galore_rank 512
-  --galore_update_proj_gap 128
-  --galore_optim_per_parameter false
+  --optim adamw_torch
   --ddp_find_unused_parameters false
   --loss_type dapo
   --epsilon 0.2
@@ -155,8 +244,10 @@ COMMON_ARGS=(
   --num_train_epochs "${JANUS_GRPO_NUM_TRAIN_EPOCHS:-4}"
   --max_steps "${JANUS_GRPO_MAX_STEPS:-3000}"
   --save_strategy steps
-  --save_steps "${JANUS_GRPO_SAVE_STEPS:-500}"
-  --save_total_limit 2
+  --save_steps "${JANUS_GRPO_SAVE_STEPS:-50}"
+  # Keep only the newest resumable checkpoint, as requested. Trainer removes
+  # the previous checkpoint only after the new checkpoint has been written.
+  --save_total_limit "${JANUS_GRPO_SAVE_TOTAL_LIMIT:-1}"
   --logging_steps 1
   --log_completions true
   --log_entropy true
@@ -175,15 +266,14 @@ COMMON_ARGS=(
   --output_dir "${OUTPUT_DIR}"
 )
 
-GRPO_BACKEND="${JANUS_GRPO_BACKEND:-fsdp2}"
 case "${GRPO_BACKEND}" in
   fsdp2)
-    COMMON_ARGS+=(--fsdp "${ROOT_DIR}/configs/fsdp2_galore.json")
+    COMMON_ARGS+=(--fsdp "${ROOT_DIR}/configs/fsdp2_lora.json")
     ;;
   ddp)
     ;;
   deepspeed)
-    COMMON_ARGS+=(--deepspeed "${ROOT_DIR}/configs/deepspeed_zero3_galore.json")
+    COMMON_ARGS+=(--deepspeed "${ROOT_DIR}/configs/deepspeed_zero3_lora.json")
     ;;
   *)
     echo "JANUS_GRPO_BACKEND must be fsdp2, ddp, or deepspeed; got ${GRPO_BACKEND}" >&2
@@ -191,12 +281,26 @@ case "${GRPO_BACKEND}" in
     ;;
 esac
 
+RESUME_CHECKPOINT="${JANUS_RESUME_FROM_CHECKPOINT:-}"
+if [[ -z "${RESUME_CHECKPOINT}" ]] && [[ "${JANUS_GRPO_AUTO_RESUME:-1}" == "1" ]]; then
+  RESUME_CHECKPOINT="$(find "${OUTPUT_DIR}" -maxdepth 1 -type d -name 'checkpoint-*' -print 2>/dev/null \
+    | sort -V | tail -n 1)"
+fi
+if [[ -n "${RESUME_CHECKPOINT}" ]]; then
+  if [[ ! -d "${RESUME_CHECKPOINT}" ]]; then
+    echo "Resume checkpoint is not a directory: ${RESUME_CHECKPOINT}" >&2
+    exit 2
+  fi
+  COMMON_ARGS+=(--resume_from_checkpoint "${RESUME_CHECKPOINT}")
+fi
+
 if (( SMOKE )); then
   COMMON_ARGS+=(
     --max_completion_length 64
+    --num_generations "${JANUS_GRPO_SMOKE_NUM_GENERATIONS:-4}"
     --per_device_train_batch_size 1
     --gradient_accumulation_steps 1
-    --generation_batch_size 16
+    --generation_batch_size "$((NPROC_PER_NODE * 4))"
     --steps_per_generation 4
     --max_resample_times 1
     --num_train_epochs 1
@@ -209,28 +313,67 @@ elif (( MEMORY_SMOKE )); then
   # a checkpoint. This is the preflight used before the supervised GRPO job.
   COMMON_ARGS+=(
     --num_train_epochs 1
-    --max_steps 1
+    --max_steps "${JANUS_GRPO_SMOKE_STEPS:-1}"
     --save_strategy no
   )
 fi
 
 echo "Launching stage-1 TQA GRPO on physical GPUs ${CUDA_VISIBLE_DEVICES}."
 echo "Distributed backend: ${GRPO_BACKEND}"
+echo "Tuner: LoRA (rank=${JANUS_LORA_RANK:-16}, alpha=${JANUS_LORA_ALPHA:-32}, dropout=${JANUS_LORA_DROPOUT:-0.05})"
+echo "Reward weighting: ${JANUS_REWARD_WEIGHTING} (variance mix ${JANUS_REWARD_VARIANCE_MIX})"
+echo "Local rollout forward batch: ${SWIFT_TRANSFORMERS_ROLLOUT_BATCH_SIZE}"
+if [[ -n "${RESUME_CHECKPOINT}" ]]; then
+  echo "Resuming from: ${RESUME_CHECKPOINT}"
+fi
 echo "Canonical input model: ${MODEL_SOURCE_DIR}"
 echo "Active model path: ${JANUS_ACTIVE_MODEL_DIR}"
+if [[ "${JANUS_NUMA_AFFINITY:-1}" == "1" ]]; then
+  echo "NUMA CPU sets by local rank: ${JANUS_NUMA_CPUSETS}"
+  echo "NUMA preferred nodes by local rank: ${JANUS_NUMA_NODES}"
+fi
 free -h
 nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv,noheader
 
 mkdir -p "${OUTPUT_DIR}"
+MAX_RAM_USED_GIB="${JANUS_MAX_RAM_USED_GIB:-115}"
+MAX_SWAP_USED_GIB="${JANUS_MAX_SWAP_USED_GIB:-0.25}"
+CURRENT_RAM_USED_GIB="$(awk '/^MemTotal:/ {total=$2} /^MemAvailable:/ {available=$2} END {printf "%.3f", (total-available)/1048576}' /proc/meminfo)"
+if ! awk -v used="${CURRENT_RAM_USED_GIB}" -v limit="${MAX_RAM_USED_GIB}" 'BEGIN {exit !(used < limit)}'; then
+  echo "Refusing launch: host RAM already uses ${CURRENT_RAM_USED_GIB} GiB; safety limit is ${MAX_RAM_USED_GIB} GiB." >&2
+  exit 3
+fi
+
+"${PYTHON_ENV}/bin/python" "${ROOT_DIR}/scripts/memory_guard.py" \
+  --output-dir "${OUTPUT_DIR}" \
+  --parent-pid "$$" \
+  --max-ram-used-gib "${MAX_RAM_USED_GIB}" \
+  --max-swap-used-gib "${MAX_SWAP_USED_GIB}" &
+MEMORY_GUARD_PID=$!
+
 "${PYTHON_ENV}/bin/python" "${ROOT_DIR}/scripts/monitor_resources.py" \
   --output-dir "${OUTPUT_DIR}" \
   --physical-gpus "${CUDA_VISIBLE_DEVICES}" \
   --parent-pid "$$" &
 RESOURCE_MONITOR_PID=$!
+TRAINING_PID=""
 cleanup_resource_monitor() {
+  if [[ -n "${TRAINING_PID}" ]]; then
+    kill -TERM -- "-${TRAINING_PID}" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      kill -0 "${TRAINING_PID}" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL -- "-${TRAINING_PID}" 2>/dev/null || true
+    wait "${TRAINING_PID}" 2>/dev/null || true
+  fi
   kill "${RESOURCE_MONITOR_PID}" 2>/dev/null || true
   wait "${RESOURCE_MONITOR_PID}" 2>/dev/null || true
+  kill "${MEMORY_GUARD_PID}" 2>/dev/null || true
+  wait "${MEMORY_GUARD_PID}" 2>/dev/null || true
 }
 trap cleanup_resource_monitor EXIT
 
-"${PYTHON_ENV}/bin/swift" rlhf "${COMMON_ARGS[@]}" "$@"
+setsid "${PYTHON_ENV}/bin/swift" rlhf "${COMMON_ARGS[@]}" "$@" &
+TRAINING_PID=$!
+wait "${TRAINING_PID}"
