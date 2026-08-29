@@ -189,17 +189,19 @@ The default local rollout forward batch is 4. A full-shape L40S preflight used
 at most 29.6 GiB per GPU and 14.9 GiB host RAM. To resume explicitly after an
 interruption:
 
-The reasoning judge first removes answer-homogeneous groups that DAPO would
-discard, uses a shared exact SQLite cache, and issues the appendix-compatible
-single-candidate prompt with concurrency 16.  Candidate batching, prompt
-truncation, 50% score sampling, and the stricter 0.625 activation threshold are
-available through `JANUS_JUDGE_*` environment variables but are off by default
-because they change judge outputs or reward semantics.
-
 ```bash
 export JANUS_RESUME_FROM_CHECKPOINT=/root/nfs/LiYJ/Janus/outputs/stage1/tqa_grpo_lora/checkpoint-500
 bash scripts/run_stage1_grpo.sh
 ```
+
+The reasoning judge first removes mastered groups that DAPO would discard,
+uses a shared exact SQLite cache, and issues the appendix-compatible
+single-candidate prompt. The five-rank run defaults to one concurrent request
+per rank so its account-wide peak is five, below the service limit of eight.
+It judges 8 of each 16 candidates and mean-imputes the remainder while keeping
+an observation mask for unbiased dispersion estimation. Candidate batching,
+prompt truncation, sampling fraction, and activation policy remain configurable
+through `JANUS_JUDGE_*` environment variables.
 
 Generate one CoT for every TQA training item and run the auditable automatic
 portion of the paper's two-stage filter:
