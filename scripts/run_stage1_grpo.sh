@@ -244,16 +244,20 @@ COMMON_ARGS=(
   --num_train_epochs "${JANUS_GRPO_NUM_TRAIN_EPOCHS:-4}"
   --max_steps "${JANUS_GRPO_MAX_STEPS:-3000}"
   --save_strategy steps
-  --save_steps "${JANUS_GRPO_SAVE_STEPS:-50}"
-  # Keep only the newest resumable checkpoint, as requested. Trainer removes
-  # the previous checkpoint only after the new checkpoint has been written.
-  --save_total_limit "${JANUS_GRPO_SAVE_TOTAL_LIMIT:-1}"
+  --save_steps "${JANUS_GRPO_SAVE_STEPS:-30}"
+  # Retain the latest two full-state checkpoints. The managed launcher also
+  # keeps an independently copied best-validation checkpoint plus manifests.
+  --save_total_limit "${JANUS_GRPO_SAVE_TOTAL_LIMIT:-2}"
+  --save_only_model false
+  # Validation is deterministic and external to Trainer so it can run after
+  # the training process releases all five GPUs at each 30-step boundary.
+  --eval_strategy no
   --logging_steps 1
   --log_completions true
   --log_entropy true
   --logging_first_step true
-  --logging_dir "${OUTPUT_DIR}/runs/trainer"
-  --report_to tensorboard
+  --logging_dir "${JANUS_TRAIN_LOGGING_DIR:-${OUTPUT_DIR}/runs/trainer}"
+  --report_to "${JANUS_REPORT_TO:-tensorboard}"
   # GRPO's generation collator returns a list of prompt records rather than a
   # standard {input_ids: tensor} batch. Transformers' generic token counters
   # assume the latter and fail before the first rollout. The GRPO plugin logs
@@ -283,14 +287,20 @@ esac
 
 RESUME_CHECKPOINT="${JANUS_RESUME_FROM_CHECKPOINT:-}"
 if [[ -z "${RESUME_CHECKPOINT}" ]] && [[ "${JANUS_GRPO_AUTO_RESUME:-1}" == "1" ]]; then
-  RESUME_CHECKPOINT="$(find "${OUTPUT_DIR}" -maxdepth 1 -type d -name 'checkpoint-*' -print 2>/dev/null \
-    | sort -V | tail -n 1)"
+  if RESUME_CHECKPOINT="$("${PYTHON_ENV}/bin/python" "${ROOT_DIR}/scripts/grpo_run_state.py" \
+      latest "${OUTPUT_DIR}" --world-size "${NPROC_PER_NODE}")"; then
+    :
+  else
+    RESUME_CHECKPOINT=""
+  fi
 fi
 if [[ -n "${RESUME_CHECKPOINT}" ]]; then
   if [[ ! -d "${RESUME_CHECKPOINT}" ]]; then
     echo "Resume checkpoint is not a directory: ${RESUME_CHECKPOINT}" >&2
     exit 2
   fi
+  "${PYTHON_ENV}/bin/python" "${ROOT_DIR}/scripts/grpo_run_state.py" \
+    verify "${RESUME_CHECKPOINT}" --world-size "${NPROC_PER_NODE}" >/dev/null
   COMMON_ARGS+=(--resume_from_checkpoint "${RESUME_CHECKPOINT}")
 fi
 

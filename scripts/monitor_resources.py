@@ -78,6 +78,24 @@ def query_gpus(selected: set[int]) -> list[dict[str, float]]:
     return rows
 
 
+def resume_offsets(csv_path: Path, interval: float) -> tuple[int, float]:
+    """Continue TensorBoard steps and elapsed time across managed segments."""
+    if not csv_path.is_file() or csv_path.stat().st_size == 0:
+        return 0, 0.0
+    system_rows = 0
+    last_elapsed = 0.0
+    with csv_path.open(encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            if row.get("kind") != "system":
+                continue
+            system_rows += 1
+            try:
+                last_elapsed = max(last_elapsed, float(row.get("elapsed_seconds") or 0.0))
+            except ValueError:
+                pass
+    return system_rows, last_elapsed + (interval if system_rows else 0.0)
+
+
 def main() -> None:
     args = parse_args()
     if args.interval <= 0:
@@ -113,7 +131,7 @@ def main() -> None:
     ]
     needs_header = not csv_path.exists() or csv_path.stat().st_size == 0
     start = time.monotonic()
-    step = 0
+    step, elapsed_offset = resume_offsets(csv_path, args.interval)
 
     with SummaryWriter(log_dir=str(event_dir), flush_secs=max(1, int(args.interval))) as writer:
         with csv_path.open("a", encoding="utf-8", newline="") as csv_handle:
@@ -123,7 +141,7 @@ def main() -> None:
 
             while not stop and process_exists(args.parent_pid):
                 wall_time = time.time()
-                elapsed = time.monotonic() - start
+                elapsed = elapsed_offset + time.monotonic() - start
                 mem = read_meminfo()
                 gib = 1024.0**3
                 ram_total = mem["MemTotal"]

@@ -92,16 +92,18 @@ mode-0600 file `/dev/shm/janus-grpo-secret.env`, install
 `deploy/remote/janus-grpo.supervisor.conf` into Supervisor, and start the
 `janus-grpo` program. No credential belongs in this repository or its logs.
 
-Real-time curves are written for every SFT and GRPO run. Start the shared
-TensorBoard server with:
+Start the TensorBoard server for the canonical managed GRPO run with:
 
 ```bash
 bash scripts/run_tensorboard.sh
 ```
 
-It watches the complete NFS `outputs/` tree, listens on port 6006, and reloads
-every five seconds. Use `http://<training-host>:6006`, or forward remote port
-6006 to your workstation and open `http://127.0.0.1:6006`.
+It exposes exactly three run names (`train`, `val`, and `resources`), listens
+on port 6006, and reloads every five seconds. Historical smoke and aborted
+events therefore cannot add duplicate curves. Set
+`JANUS_TENSORBOARD_ALL_RUNS=1` only when an explicit cross-run comparison is
+needed. Use `http://<training-host>:6006`, or forward remote port 6006 to your
+workstation and open `http://127.0.0.1:6006`.
 
 SFT reports loss, token accuracy, learning rate, gradient norm, input tokens,
 runtime, and throughput. GRPO additionally reports the curves shown in the
@@ -182,17 +184,34 @@ storing it in the repository:
 
 ```bash
 export OPENAI_API_KEY='...'
-bash scripts/run_stage1_grpo.sh
+bash scripts/run_stage1_grpo_managed.sh
 ```
+
+The managed run ends each 30-step segment, verifies and hashes a full-state
+checkpoint, runs deterministic greedy evaluation on the complete 2,781-item
+TQA validation split, then resumes the next segment. It keeps the two newest
+resumable checkpoints and an independent full copy of the best checkpoint by
+validation accuracy (strict-format rate breaks ties). Atomic `last-checkpoint`,
+`previous-checkpoint`, and `best-checkpoint` symlinks plus `resume_state.json`
+make the recovery choice auditable. Restarting the same command verifies the
+files, removes partial post-checkpoint JSONL/TensorBoard steps, and resumes from
+the newest intact 30-step boundary.
+
+The managed run writes to the fresh
+`outputs/stage1/tqa_grpo_lora_managed30` namespace. The earlier 50-step trial
+stays in `outputs/stage1/tqa_grpo_lora` for audit and is not loaded by the
+scoped TensorBoard server.
 
 The default local rollout forward batch is 4. A full-shape L40S preflight used
-at most 29.6 GiB per GPU and 14.9 GiB host RAM. To resume explicitly after an
-interruption:
+at most 29.6 GiB per GPU and 14.9 GiB host RAM. To resume one checkpoint
+explicitly outside the managed loop:
 
 ```bash
-export JANUS_RESUME_FROM_CHECKPOINT=/root/nfs/LiYJ/Janus/outputs/stage1/tqa_grpo_lora/checkpoint-500
+export JANUS_RESUME_FROM_CHECKPOINT=/root/nfs/LiYJ/Janus/outputs/stage1/tqa_grpo_lora/checkpoint-30
 bash scripts/run_stage1_grpo.sh
 ```
+
+Operational details are in `docs/grpo_managed_training.md`.
 
 The reasoning judge first removes mastered groups that DAPO would discard,
 uses a shared exact SQLite cache, and issues the appendix-compatible

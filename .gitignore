@@ -11,6 +11,7 @@ upstream/
 data/
 models/
 outputs/
+run_archives/
 logs/
 wandb/
 *.log

@@ -4,12 +4,13 @@ set -Eeuo pipefail
 # Read the API key once from a private FIFO so it never appears in the tmux
 # command line, repository, or training log. The caller owns creating/writing
 # the FIFO; this process removes it immediately after reading it.
-if [[ $# -ne 1 ]]; then
-  echo "usage: $0 /tmp/janus-grpo-secret.XXXXXX/key" >&2
+if [[ $# -lt 1 || $# -gt 2 || ( $# -eq 2 && "$2" != "--managed" ) ]]; then
+  echo "usage: $0 /tmp/janus-grpo-secret.XXXXXX/key [--managed]" >&2
   exit 2
 fi
 
 key_fifo=$1
+mode=${2:-}
 secret_dir=${key_fifo%/*}
 
 case "$key_fifo" in
@@ -43,4 +44,7 @@ export OPENAI_API_KEY
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
+if [[ "$mode" == "--managed" ]]; then
+  exec bash scripts/run_stage1_grpo_managed.sh
+fi
 exec bash scripts/run_stage1_grpo.sh

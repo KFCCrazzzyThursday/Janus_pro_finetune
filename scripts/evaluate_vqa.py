@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import re
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "upstream/deepseek-janus"))
 
@@ -88,6 +90,11 @@ def init_distributed() -> tuple[int, int, int]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument(
+        "--adapter",
+        type=Path,
+        help="Optional PEFT/LoRA checkpoint to load on top of --model.",
+    )
     parser.add_argument("--model-source", type=Path)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -125,6 +132,22 @@ def main() -> None:
         dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
     )
+    if args.adapter is not None:
+        if not (args.adapter / "adapter_config.json").is_file():
+            raise FileNotFoundError(
+                f"LoRA checkpoint has no adapter_config.json: {args.adapter}"
+            )
+        # PEFT requires this generation hook on Janus' composite wrapper. The
+        # training plugin installs the same compatibility shim before LoRA is
+        # created, so validation exercises the identical module structure.
+        from peft import PeftModel
+
+        importlib.import_module("training.plugins.janus_lora_compat")
+        model = PeftModel.from_pretrained(
+            model,
+            str(args.adapter),
+            is_trainable=False,
+        )
     model = model.to(device=f"cuda:{local_rank}", dtype=torch.bfloat16).eval()
 
     correct = 0
@@ -187,6 +210,14 @@ def main() -> None:
                     parsed = parse_completion(response)
                     predicted = permissive_index(response, row["choices"])
                     is_correct = predicted == row["answer_index"]
+                    completion_tokens = len(
+                        tokenizer.encode(response, add_special_tokens=False)
+                    )
+                    reasoning_tokens = (
+                        len(tokenizer.encode(parsed.reasoning, add_special_tokens=False))
+                        if parsed.reasoning is not None
+                        else None
+                    )
                     correct += int(is_correct)
                     strict += int(parsed.strict_format)
                     results.append({
@@ -197,6 +228,8 @@ def main() -> None:
                         "predicted_index": predicted,
                         "correct": is_correct,
                         "strict_format": parsed.strict_format,
+                        "completion_tokens": completion_tokens,
+                        "reasoning_tokens": reasoning_tokens,
                         "response": response,
                         "error": None,
                     })
@@ -210,6 +243,8 @@ def main() -> None:
                         "predicted_index": None,
                         "correct": False,
                         "strict_format": False,
+                        "completion_tokens": None,
+                        "reasoning_tokens": None,
                         "response": "",
                         "error": f"{type(exc).__name__}: {exc}",
                     }
@@ -239,14 +274,36 @@ def main() -> None:
         with predictions_path.open("w", encoding="utf-8") as handle:
             for row in merged:
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        valid_completion_lengths = [
+            row["completion_tokens"]
+            for row in merged
+            if row["completion_tokens"] is not None
+        ]
+        valid_reasoning_lengths = [
+            row["reasoning_tokens"]
+            for row in merged
+            if row["reasoning_tokens"] is not None
+        ]
         summary = {
-            "model": str(args.model.resolve()),
+            "model": str((args.adapter or args.model).resolve()),
+            "base_model": str(args.model.resolve()),
+            "adapter": str(args.adapter.resolve()) if args.adapter else None,
             "model_source": str((args.model_source or args.model).resolve()),
             "input": str(args.input.resolve()),
             "num_samples": len(merged),
             "accuracy": sum(row["correct"] for row in merged) / len(merged),
             "strict_format_rate": sum(row["strict_format"] for row in merged) / len(merged),
             "parse_failure_rate": sum(row["predicted_index"] is None for row in merged) / len(merged),
+            "mean_completion_tokens": (
+                sum(valid_completion_lengths) / len(valid_completion_lengths)
+                if valid_completion_lengths
+                else None
+            ),
+            "mean_reasoning_tokens": (
+                sum(valid_reasoning_lengths) / len(valid_reasoning_lengths)
+                if valid_reasoning_lengths
+                else None
+            ),
             "runtime_seconds": time.time() - started,
             "world_size": world_size,
             "seed": args.seed,
