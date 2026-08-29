@@ -26,6 +26,29 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def keep_response_prefix_open(
+    input_ids: Any,
+    *,
+    response_prefix: str,
+    eos_token_id: int,
+) -> Any:
+    """Remove the chat-template EOS that would close a seeded response.
+
+    Janus' conversation formatter appends EOS whenever the final Assistant
+    message has non-empty content.  A response prefix is continuation context,
+    not a completed Assistant turn, so leaving that EOS in place makes the
+    model start a new response and commonly emit the prefix a second time.
+    """
+    if not response_prefix:
+        return input_ids
+    if len(input_ids) == 0 or int(input_ids[-1]) != int(eos_token_id):
+        raise RuntimeError(
+            "Janus response prefix did not end in the expected template EOS; "
+            "refusing to evaluate with an ambiguous generation prompt"
+        )
+    return input_ids[:-1]
+
+
 def permissive_index(text: str, choices: list[str]) -> int | None:
     parsed = parse_completion(text)
     if parsed.choice_index is not None:
@@ -173,13 +196,17 @@ def main() -> None:
                     ]
                     images = [Image.open(path).convert("RGB") for path in row["images"]]
                     any_images = any_images or bool(images)
-                    prepare_list.append(
-                        processor(
-                            conversations=conversation,
-                            images=images,
-                            force_batchify=False,
-                        )
+                    prepared_row = processor(
+                        conversations=conversation,
+                        images=images,
+                        force_batchify=False,
                     )
+                    prepared_row.input_ids = keep_response_prefix_open(
+                        prepared_row.input_ids,
+                        response_prefix=args.response_prefix,
+                        eos_token_id=tokenizer.eos_token_id,
+                    )
+                    prepare_list.append(prepared_row)
                 prepared = processor.batchify(prepare_list).to(model.device)
                 if any_images:
                     inputs_embeds = model.prepare_inputs_embeds(**prepared)
@@ -310,6 +337,11 @@ def main() -> None:
             "max_new_tokens": args.max_new_tokens,
             "batch_size_per_rank": args.batch_size,
             "response_prefix": args.response_prefix,
+            "response_prefix_conditioning": (
+                "assistant_context_without_terminal_eos"
+                if args.response_prefix
+                else "none"
+            ),
         }
         (args.output_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"

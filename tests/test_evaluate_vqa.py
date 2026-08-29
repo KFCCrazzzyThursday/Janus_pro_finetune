@@ -4,7 +4,39 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from evaluate_vqa import permissive_index  # noqa: E402
+from evaluate_vqa import keep_response_prefix_open, permissive_index  # noqa: E402
+
+
+def test_response_prefix_removes_template_terminal_eos() -> None:
+    input_ids = [100602, 25, 459, 17249, 29, 100001]
+    assert keep_response_prefix_open(
+        input_ids,
+        response_prefix="<think>",
+        eos_token_id=100001,
+    ) == [100602, 25, 459, 17249, 29]
+
+
+def test_empty_response_prefix_leaves_prompt_unchanged() -> None:
+    input_ids = [100602, 25]
+    assert keep_response_prefix_open(
+        input_ids,
+        response_prefix="",
+        eos_token_id=100001,
+    ) is input_ids
+
+
+def test_response_prefix_rejects_prompt_without_template_eos() -> None:
+    input_ids = [100602, 25, 459, 17249, 29]
+    try:
+        keep_response_prefix_open(
+            input_ids,
+            response_prefix="<think>",
+            eos_token_id=100001,
+        )
+    except RuntimeError as exc:
+        assert "expected template EOS" in str(exc)
+    else:
+        raise AssertionError("missing template EOS must fail closed")
 
 
 def test_permissive_index_reads_zero_based_numeric_answer() -> None:

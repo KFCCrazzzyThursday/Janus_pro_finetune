@@ -52,10 +52,12 @@ if [[ -s "${SUMMARY}" ]]; then
   recorded_adapter="$(jq -r '.adapter // empty' "${SUMMARY}")"
   recorded_input="$(jq -r '.input // empty' "${SUMMARY}")"
   recorded_samples="$(jq -r '.num_samples // 0' "${SUMMARY}")"
+  recorded_prefix_conditioning="$(jq -r '.response_prefix_conditioning // empty' "${SUMMARY}")"
   expected_samples="$(wc -l < "${VAL_DATASET}")"
   if [[ "${recorded_adapter}" == "${CHECKPOINT}" \
         && "${recorded_input}" == "$(realpath "${VAL_DATASET}")" \
         && "${recorded_samples}" == "${expected_samples}" \
+        && "${recorded_prefix_conditioning}" == "assistant_context_without_terminal_eos" \
         && -z "${JANUS_GRPO_VAL_MAX_SAMPLES:-}" ]]; then
     reuse=1
   fi
