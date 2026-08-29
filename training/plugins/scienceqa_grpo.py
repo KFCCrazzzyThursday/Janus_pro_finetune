@@ -919,15 +919,24 @@ def _scheduled_reward_priors(trainer) -> torch.Tensor:
     step = int(trainer.state.global_step)
     max_steps = max(int(getattr(trainer.state, "max_steps", 3000)), 1)
     decay_lambda = float(os.environ.get("JANUS_REWARD_DECAY_LAMBDA", 0.20 / max_steps))
-    format_prior = max(0.25, 0.45 - decay_lambda * step)
-    reasoning_prior = 0.50 - format_prior
     variant = os.environ.get("JANUS_REWARD_PRIOR", "table").lower()
     if variant == "equation":
         accuracy_prior, length_prior = 0.30, 0.20
+        format_start, format_floor, format_reasoning_total = 0.45, 0.25, 0.50
     elif variant == "table":
         accuracy_prior, length_prior = 0.25, 0.25
+        format_start, format_floor, format_reasoning_total = 0.45, 0.25, 0.50
+    elif variant == "accuracy_format":
+        # Post-step-30 setting: correctness first, then strict format, then
+        # reasoning quality; completion length remains an auxiliary signal.
+        accuracy_prior, length_prior = 0.32, 0.08
+        format_start, format_floor, format_reasoning_total = 0.48, 0.30, 0.60
     else:
-        raise ValueError("JANUS_REWARD_PRIOR must be 'table' or 'equation'")
+        raise ValueError(
+            "JANUS_REWARD_PRIOR must be 'table', 'equation', or 'accuracy_format'"
+        )
+    format_prior = max(format_floor, format_start - decay_lambda * step)
+    reasoning_prior = format_reasoning_total - format_prior
     return torch.tensor(
         [accuracy_prior, length_prior, format_prior, reasoning_prior],
         dtype=torch.float32,

@@ -13,11 +13,26 @@ sys.path.insert(0, str(ROOT / "training/plugins"))
 
 from scienceqa_grpo import (  # noqa: E402
     JanusReasoningReward,
+    _scheduled_reward_priors,
     population_advantages,
     reward_monitoring_metrics,
     reward_weighting_dispersions,
     variance_weighted_components,
 )
+
+
+def test_accuracy_format_priors_follow_post_step30_priority_order(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JANUS_REWARD_PRIOR", "accuracy_format")
+    monkeypatch.setenv("JANUS_REWARD_DECAY_LAMBDA", "0.00006666666666666667")
+    trainer = SimpleNamespace(
+        state=SimpleNamespace(global_step=30, max_steps=60),
+        accelerator=SimpleNamespace(device=torch.device("cpu")),
+    )
+    priors = _scheduled_reward_priors(trainer)
+    assert torch.allclose(priors, torch.tensor([0.32, 0.08, 0.478, 0.122]))
+    assert math.isclose(priors.sum().item(), 1.0, abs_tol=1e-7)
 
 
 def test_variance_weighted_components_are_group_local() -> None:

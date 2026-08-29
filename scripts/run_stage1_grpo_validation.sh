@@ -92,3 +92,12 @@ fi
 
 echo "Validation summary: ${SUMMARY}"
 jq '{accuracy,strict_format_rate,parse_failure_rate,mean_reasoning_tokens,mean_completion_tokens,num_samples,runtime_seconds}' "${SUMMARY}"
+
+pause_marker="${RUN_DIR}/.pause-after-validation-step-${step}"
+if [[ -e "${pause_marker}" ]]; then
+  echo "Validation for step ${step} is complete; paused while ${pause_marker} exists."
+  while [[ -e "${pause_marker}" ]]; do
+    sleep 5
+  done
+  echo "Pause marker removed; continuing managed training."
+fi

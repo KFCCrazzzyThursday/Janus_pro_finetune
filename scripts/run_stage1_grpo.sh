@@ -116,7 +116,11 @@ export JANUS_JUDGE_ACTIVATION_THRESHOLD="${JANUS_JUDGE_ACTIVATION_THRESHOLD:-0.6
 export JANUS_JUDGE_SKIP_HOMOGENEOUS="${JANUS_JUDGE_SKIP_HOMOGENEOUS:-1}"
 export JANUS_JUDGE_PRESAMPLE_FILTER="${JANUS_JUDGE_PRESAMPLE_FILTER:-1}"
 export JANUS_JUDGE_PROMPT_VERSION="${JANUS_JUDGE_PROMPT_VERSION:-paper-batch-v1}"
-export JANUS_REWARD_PRIOR="${JANUS_REWARD_PRIOR:-table}"
+# The first 30-step segment used the thesis-table prior. Subsequent launches
+# default to correctness first, strict format second, reasoning quality third,
+# and length as an auxiliary signal. This was selected from the paired step-50
+# validation and the first segment's observed effective weights.
+export JANUS_REWARD_PRIOR="${JANUS_REWARD_PRIOR:-accuracy_format}"
 # Preserve the paper formula as an explicit ablation, but make the corrected
 # range-normalized standard-deviation weighting unambiguous for this L40S run.
 export JANUS_REWARD_WEIGHTING="${JANUS_REWARD_WEIGHTING:-stabilized}"
