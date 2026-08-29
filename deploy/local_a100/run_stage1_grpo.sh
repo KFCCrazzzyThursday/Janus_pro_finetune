@@ -31,6 +31,11 @@ export JANUS_LORA_ALPHA="${JANUS_LORA_ALPHA:-64}"
 export JANUS_LORA_DROPOUT="${JANUS_LORA_DROPOUT:-0.05}"
 export JANUS_GRPO_LEARNING_RATE="${JANUS_GRPO_LEARNING_RATE:-1e-5}"
 export JANUS_OPTIM="${JANUS_OPTIM:-adamw_torch}"
+# The A100 experiment uses the stabilized variance curriculum documented in
+# docs/reward_variance_weighting_revision.md.  Set this to "paper" for an exact
+# equations-(3.9)-(3.10) ablation.
+export JANUS_REWARD_WEIGHTING="${JANUS_REWARD_WEIGHTING:-stabilized}"
+export JANUS_REWARD_VARIANCE_MIX="${JANUS_REWARD_VARIANCE_MIX:-0.5}"
 export JANUS_STAGE_MODEL_TO_RAM="${JANUS_STAGE_MODEL_TO_RAM:-0}"
 export JANUS_KEEP_HTTP_PROXY="${JANUS_KEEP_HTTP_PROXY:-1}"
 export JANUS_STAGE1_SFT_MODEL="${JANUS_STAGE1_SFT_MODEL:-${ROOT_DIR}/models/Janus-Pro-7B-stage1-sft}"

@@ -16,6 +16,10 @@ The paper settings and all identified ambiguities are recorded in
 `configs/paper.yaml` and `reproducibility/paper_audit.md`. Exact software and
 hardware versions are in `reproducibility/environment.md`.
 
+The rationale, equations, compatibility mode, and validation plan for the
+range-normalized stabilized reward weighting are documented in
+`docs/reward_variance_weighting_revision.md`.
+
 For the single-host `8 x A100-SXM4-40GB` deployment, see
 `deploy/local_a100/README.md`. Its validated profile is LoRA + 8-rank DDP with
 AdamW (GaLore disabled), launched and monitored in tmux. The measured run
@@ -109,9 +113,10 @@ runtime, and throughput. GRPO additionally reports the curves shown in the
 paper: overall reward mean/variance and the Accuracy, Format, Length, and
 Reasoning reward means/variances. Extra GRPO diagnostics include component
 contributions, dynamic reward weights, correct/strict-format/reasoning-active
-fractions, retained groups and advantages, KL and its scheduled coefficient,
-entropy, low/high clipping ratios, completion length/truncation, and rollout
-throughput. A separate resource run records physical GPUs 0, 1, 3, and 4
+fractions, scheduled priors, normalized weighting dispersions, the actually
+judged reasoning fraction, retained groups and advantages, KL and its scheduled
+coefficient, entropy, low/high clipping ratios, completion length/truncation,
+and rollout throughput. A separate resource run records physical GPUs 0, 1, 3, and 4
 (memory, utilization, power, temperature) plus host RAM, swap, and load to both
 TensorBoard and `resource_metrics.csv`; physical GPU 2 is never sampled.
 

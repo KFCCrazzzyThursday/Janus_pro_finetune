@@ -16,6 +16,7 @@ systems/runbook snapshot, not a final convergence report.
 | Trainable parameters | 74.9568M / 7.495B (1.00%) |
 | Optimizer | AdamW, LR 1e-5; GaLore disabled |
 | GRPO | DAPO loss, G=16, clip=0.2/0.28, KL beta=0.04 |
+| Reward weighting | stabilized range-normalized dispersion, 50% scheduled-prior mix (`paper` remains available) |
 | Batch | per-device=1, GA=16, generation batch=128, steps/generation=16 |
 | Generation | Transformers backend, rollout chunk=4, max completion=384 |
 | Checkpointing | gradient checkpointing enabled; save every 500 steps |
@@ -51,6 +52,9 @@ and DDP avoids the complexity of sharding a custom multimodal wrapper.
 
 The repository retains optional FSDP2 compatibility code for other profiles,
 but `deploy/local_a100/run_stage1_grpo.sh` defaults to LoRA, AdamW, and DDP.
+The A100 launcher also defaults to the stabilized reward weighting described in
+`docs/reward_variance_weighting_revision.md`; export
+`JANUS_REWARD_WEIGHTING=paper` for the original equations-(3.9)-(3.10) ablation.
 
 ## Operation
 

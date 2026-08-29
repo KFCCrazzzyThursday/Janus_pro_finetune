@@ -96,6 +96,8 @@ export JANUS_JUDGE_PIPELINE="${JANUS_JUDGE_PIPELINE:-0}"
 export JANUS_JUDGE_PROMPT_VERSION="${JANUS_JUDGE_PROMPT_VERSION:-pipeline-v1}"
 export JANUS_REWARD_PRIOR="${JANUS_REWARD_PRIOR:-table}"
 export JANUS_REWARD_DECAY_LAMBDA="${JANUS_REWARD_DECAY_LAMBDA:-0.00006666666666666667}"
+export JANUS_REWARD_WEIGHTING="${JANUS_REWARD_WEIGHTING:-paper}"
+export JANUS_REWARD_VARIANCE_MIX="${JANUS_REWARD_VARIANCE_MIX:-0.5}"
 export JANUS_KL_DECAY_STEPS="${JANUS_KL_DECAY_STEPS:-500}"
 export JANUS_ADVANTAGE_THRESHOLD="${JANUS_ADVANTAGE_THRESHOLD:-0.2}"
 # ms-swift's outer RLHF arguments expose local_rollout_forward_batch_size,
@@ -218,12 +220,20 @@ case "${GRPO_BACKEND}" in
 esac
 
 if (( SMOKE )); then
+  SMOKE_PER_DEVICE_BATCH="${JANUS_GRPO_SMOKE_PER_DEVICE_BATCH:-1}"
+  SMOKE_GENERATION_BATCH="${JANUS_GRPO_SMOKE_GENERATION_BATCH:-16}"
+  SMOKE_STEP_DENOMINATOR=$((SMOKE_PER_DEVICE_BATCH * NPROC_PER_NODE))
+  if (( SMOKE_GENERATION_BATCH % SMOKE_STEP_DENOMINATOR != 0 )); then
+    echo "Smoke generation batch must be divisible by per-device batch * world size." >&2
+    exit 2
+  fi
+  SMOKE_STEPS_PER_GENERATION=$((SMOKE_GENERATION_BATCH / SMOKE_STEP_DENOMINATOR))
   COMMON_ARGS+=(
     --max_completion_length 64
-    --per_device_train_batch_size 1
+    --per_device_train_batch_size "${SMOKE_PER_DEVICE_BATCH}"
     --gradient_accumulation_steps 1
-    --generation_batch_size 16
-    --steps_per_generation 4
+    --generation_batch_size "${SMOKE_GENERATION_BATCH}"
+    --steps_per_generation "${SMOKE_STEPS_PER_GENERATION}"
     --max_resample_times 1
     --num_train_epochs 1
     --max_steps 1
@@ -242,6 +252,7 @@ fi
 
 echo "Launching stage-1 TQA GRPO on physical GPUs ${CUDA_VISIBLE_DEVICES}."
 echo "Distributed backend: ${GRPO_BACKEND}"
+echo "Reward weighting: ${JANUS_REWARD_WEIGHTING} (variance mix ${JANUS_REWARD_VARIANCE_MIX})"
 echo "Canonical input model: ${MODEL_SOURCE_DIR}"
 echo "Active model path: ${JANUS_ACTIVE_MODEL_DIR}"
 free -h

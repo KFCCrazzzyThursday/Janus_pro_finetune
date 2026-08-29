@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "training/plugins"))
 from scienceqa_grpo import (  # noqa: E402
     JanusReasoningReward,
     population_advantages,
+    reward_weighting_dispersions,
     reward_monitoring_metrics,
     variance_weighted_components,
 )
@@ -34,6 +35,45 @@ def test_variance_weighted_components_are_group_local() -> None:
     assert torch.allclose(weights[0], torch.tensor([1.0, 0.0, 0.0, 0.0]))
     assert torch.allclose(weights[1], torch.tensor([0.0, 0.0, 1.0, 0.0]))
     assert torch.allclose(contributions.sum(1), torch.tensor([-1.0, 1.0, 0.0, 1.0]))
+
+
+def test_stabilized_weights_mix_priors_with_range_normalized_dispersion() -> None:
+    raw = torch.tensor(
+        [
+            [-1.0, 0.5, 1.0, 0.0],
+            [1.0, 0.5, 1.0, 1.0],
+            [-1.0, 0.5, 1.0, 0.5],
+            [1.0, 0.5, 1.0, 0.5],
+        ]
+    )
+    priors = torch.tensor([0.25, 0.25, 0.45, 0.05])
+    observed = torch.tensor([True, True, False, False])
+    contributions, weights = variance_weighted_components(
+        raw,
+        4,
+        priors,
+        mode="stabilized",
+        reasoning_observed_mask=observed,
+        variance_mix=0.5,
+    )
+    dispersions = reward_weighting_dispersions(
+        raw,
+        4,
+        mode="stabilized",
+        reasoning_observed_mask=observed,
+    )
+
+    # Accuracy's [-1, 1] range is normalized to width two.  Reasoning uses
+    # only the two actually judged scores and an unbiased sample variance;
+    # the two prompt-mean imputations do not shrink its dispersion.
+    assert torch.allclose(dispersions[0, 0], torch.tensor(0.5))
+    assert torch.allclose(dispersions[0, 3], torch.tensor(math.sqrt(0.5)))
+    assert torch.allclose(weights.sum(dim=1), torch.ones(1))
+    assert weights[0, 0] < 1.0
+    assert weights[0, 1] == 0.125
+    assert weights[0, 2] == 0.225
+    assert weights[0, 3] > priors[3]
+    assert contributions.shape == raw.shape
 
 
 def test_population_advantage_threshold() -> None:
@@ -116,6 +156,11 @@ class _FakeCompletions:
 def test_reasoning_batches_and_reuses_shared_cache(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.delenv("JANUS_REASONING_JUDGE_SMOKE_STUB", raising=False)
+    proxy_variables = (
+        "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy",
+    )
+    for variable in proxy_variables:
+        monkeypatch.delenv(variable, raising=False)
     monkeypatch.setenv("JANUS_JUDGE_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("JANUS_JUDGE_CACHE_PATH", str(tmp_path / "cache.sqlite3"))
     monkeypatch.setenv("JANUS_JUDGE_BATCH_SIZE", "2")
@@ -153,6 +198,7 @@ def test_reasoning_sampling_imputes_prompt_mean(monkeypatch, tmp_path) -> None:
         )
     )
     assert values == [0.0] * 4
+    assert sum(reward.last_observed_mask) == 2
     rows = [json.loads(line) for line in (tmp_path / "judge_calls.rank00.jsonl").read_text().splitlines()]
     assert sum(row["estimated"] for row in rows) == 2
 

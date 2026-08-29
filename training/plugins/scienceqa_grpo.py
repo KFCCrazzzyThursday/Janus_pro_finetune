@@ -1,4 +1,4 @@
-"""Paper-faithful ScienceQA rewards and GRPO hooks for ms-swift.
+"""ScienceQA rewards and paper-compatible GRPO hooks for ms-swift.
 
 The thesis changes more than the four scalar reward functions: it weights
 reward components by their within-group variances, discards answer-homogeneous
@@ -6,6 +6,8 @@ groups, removes low-magnitude advantages, and linearly decays the KL penalty.
 ms-swift exposes scalar reward plugins but not those group-level operations, so
 this external plugin installs narrowly guarded hooks on ``GRPOTrainer``.  The
 hooks are active only when all four ``Janus*Reward`` classes below are selected.
+The original variance weighting remains available as ``paper`` mode; the
+range-normalized, prior-mixed extension is selected as ``stabilized`` mode.
 """
 
 from __future__ import annotations
@@ -33,6 +35,10 @@ from janus_repro.rewards import accuracy_reward, format_reward, length_reward, p
 
 logger = get_logger()
 COMPONENT_ORDER = ("accuracy", "length", "format", "reasoning")
+# Widths of the four reward functions' theoretical output ranges.  Comparing
+# raw variances would otherwise give the [-1, 1] accuracy reward a fourfold
+# variance-scale advantage over rewards bounded to [0, 1].
+COMPONENT_RANGES = (2.0, 1.0, 1.0, 1.0)
 
 
 def _as_list(value: Any, size: int, default: Any = None) -> list[Any]:
@@ -148,6 +154,10 @@ class JanusReasoningReward(AsyncORM):
         self.prompt_version = os.environ.get("JANUS_JUDGE_PROMPT_VERSION", "v1")
         self.process_group = None
         self.stats: dict[str, int] = defaultdict(int)
+        # The group-level weighting hook reads this after reward evaluation.
+        # True means that the score was judged (or loaded from the judge cache),
+        # rather than filled with the sampled prompt mean.
+        self.last_observed_mask: list[bool] = []
         if self.cache_enabled:
             self._init_cache()
 
@@ -404,6 +414,7 @@ class JanusReasoningReward(AsyncORM):
     ) -> list[float]:
         stats_before = dict(self.stats)
         size = len(completions)
+        self.last_observed_mask = [False] * size
         indices = [int(value) for value in _as_list(answer_index, size, -1)]
         texts = [str(value) for value in _as_list(answer_text, size, "")]
         questions = [str(value) for value in _as_list(question, size, "")]
@@ -457,12 +468,14 @@ class JanusReasoningReward(AsyncORM):
                     )
                 )
         rewards = [0.0] * size
+        observed = [False] * size
         if tasks:
             values = await asyncio.gather(*(task for _, _, task in tasks))
             sampled_scores: dict[str, list[float]] = defaultdict(list)
             for (current_prompt_id, chunk, _), chunk_values in zip(tasks, values):
                 for index, value in zip(chunk, chunk_values):
                     rewards[index] = value
+                    observed[index] = True
                     sampled_scores[current_prompt_id].append(value)
             if self.sample_fraction < 1.0:
                 for current_prompt_id, prompt_indices in grouped.items():
@@ -488,6 +501,7 @@ class JanusReasoningReward(AsyncORM):
             delta.get("api_batches", 0), delta.get("cache_hits", 0),
             delta.get("estimated_candidates", 0),
         )
+        self.last_observed_mask = observed
         return rewards
 
 
@@ -501,23 +515,92 @@ def variance_weighted_components(
     raw_rewards: torch.Tensor,
     num_generations: int,
     beta_weights: torch.Tensor,
+    *,
+    mode: str = "paper",
+    reasoning_observed_mask: torch.Tensor | None = None,
+    variance_mix: float = 0.5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply equations (3.9)-(3.10) independently to every prompt group."""
+    """Weight reward components independently inside every prompt group.
+
+    ``paper`` reproduces equations (3.9)-(3.10): final weights are directly
+    proportional to ``beta * population_variance``.
+
+    ``stabilized`` keeps the thesis' high-dispersion curriculum while avoiding
+    reward-scale and sparse-judge artifacts.  It range-normalizes variances,
+    uses standard deviation as the gentler dispersion statistic, estimates the
+    reasoning dispersion only from genuinely judged samples, and mixes the
+    adaptive distribution with the scheduled beta prior.
+    """
+    dispersions = reward_weighting_dispersions(
+        raw_rewards,
+        num_generations,
+        mode=mode,
+        reasoning_observed_mask=reasoning_observed_mask,
+    )
+    if not 0.0 <= variance_mix <= 1.0:
+        raise ValueError("variance_mix must be in [0, 1]")
+
+    normalized_priors = beta_weights / beta_weights.sum()
+    numerators = dispersions * beta_weights.unsqueeze(0)
+    denominators = numerators.sum(dim=1, keepdim=True)
+    adaptive_weights = torch.where(
+        denominators > 0,
+        numerators / denominators.clamp_min(torch.finfo(raw_rewards.dtype).eps),
+        normalized_priors.unsqueeze(0),
+    )
+    if mode == "paper":
+        weights = adaptive_weights
+    elif mode == "stabilized":
+        weights = (1.0 - variance_mix) * normalized_priors.unsqueeze(0) + variance_mix * adaptive_weights
+    else:  # reward_weighting_dispersions normally catches this first.
+        raise ValueError("mode must be 'paper' or 'stabilized'")
+
+    grouped = raw_rewards.view(-1, num_generations, len(COMPONENT_ORDER))
+    return (grouped * weights.unsqueeze(1)).view_as(raw_rewards), weights
+
+
+def reward_weighting_dispersions(
+    raw_rewards: torch.Tensor,
+    num_generations: int,
+    *,
+    mode: str,
+    reasoning_observed_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return the per-group statistic used to adapt component weights."""
     if raw_rewards.ndim != 2 or raw_rewards.shape[1] != 4:
         raise ValueError(f"expected [N, 4] raw rewards, got {tuple(raw_rewards.shape)}")
     if raw_rewards.shape[0] % num_generations:
         raise ValueError("global reward count must be divisible by num_generations")
-    grouped = raw_rewards.view(-1, num_generations, 4)
+    grouped = raw_rewards.view(-1, num_generations, len(COMPONENT_ORDER))
     variances = ((grouped - grouped.mean(dim=1, keepdim=True)) ** 2).mean(dim=1)
-    numerators = variances * beta_weights.unsqueeze(0)
-    denominators = numerators.sum(dim=1, keepdim=True)
-    fallback = beta_weights / beta_weights.sum()
-    weights = torch.where(
-        denominators > 0,
-        numerators / denominators.clamp_min(torch.finfo(raw_rewards.dtype).eps),
-        fallback.unsqueeze(0),
-    )
-    return (grouped * weights.unsqueeze(1)).view_as(raw_rewards), weights
+    if mode == "paper":
+        return variances
+    if mode != "stabilized":
+        raise ValueError("mode must be 'paper' or 'stabilized'")
+
+    ranges = raw_rewards.new_tensor(COMPONENT_RANGES)
+    normalized_variances = variances / ranges.square().unsqueeze(0)
+    if reasoning_observed_mask is not None:
+        if reasoning_observed_mask.numel() != raw_rewards.shape[0]:
+            raise ValueError("reasoning_observed_mask must have one entry per completion")
+        observed = reasoning_observed_mask.to(device=raw_rewards.device, dtype=torch.bool).view(
+            -1, num_generations
+        )
+        values = grouped[:, :, COMPONENT_ORDER.index("reasoning")]
+        counts = observed.sum(dim=1)
+        means = (values * observed).sum(dim=1) / counts.clamp_min(1)
+        squared = ((values - means.unsqueeze(1)) ** 2 * observed).sum(dim=1)
+        # The judged subset is a deterministic content-hash sample.  Bessel's
+        # correction estimates the full candidate distribution without the
+        # variance shrinkage caused by prompt-mean imputation.
+        observed_variance = torch.where(
+            counts > 1,
+            squared / (counts - 1).clamp_min(1),
+            torch.zeros_like(squared),
+        )
+        normalized_variances = normalized_variances.clone()
+        normalized_variances[:, COMPONENT_ORDER.index("reasoning")] = observed_variance
+    return normalized_variances.clamp_min(0).sqrt()
 
 
 def population_advantages(
@@ -617,6 +700,28 @@ def _component_indices(trainer) -> list[int] | None:
     return [positions[name] for name in COMPONENT_ORDER]
 
 
+def _gather_reasoning_observed_mask(trainer, samples: Sequence[Any]) -> torch.Tensor:
+    """Gather the local judge/imputation masks in reward-tensor rank order."""
+    reasoning_func = next(
+        (
+            func
+            for func in trainer.reward_funcs
+            if getattr(func, "janus_component", None) == "reasoning"
+        ),
+        None,
+    )
+    local = None if reasoning_func is None else getattr(reasoning_func, "last_observed_mask", None)
+    locally_valid = local is not None and len(local) == len(samples)
+    # Every rank enters both collectives even if one rank has an invalid mask,
+    # avoiding a one-sided exception that would strand the remaining ranks.
+    validity = gather_object([locally_valid])
+    local_values = list(local) if locally_valid else [False] * len(samples)
+    gathered = gather_object(local_values)
+    if not all(validity):
+        raise RuntimeError("Reasoning judge did not expose one observation-mask entry per local sample")
+    return torch.tensor(gathered, dtype=torch.bool, device=trainer.accelerator.device)
+
+
 def _answer_variation_mask(samples: Sequence[Any], num_generations: int, device: torch.device) -> torch.Tensor:
     global_samples = gather_object(list(samples))
     if len(global_samples) % num_generations:
@@ -675,8 +780,28 @@ def _install_group_level_hooks() -> None:
 
         num_generations = self.num_generations if self.model.training else self.num_generations_eval
         priors = _scheduled_reward_priors(self).to(dtype=rewards.dtype)
+        weighting_mode = os.environ.get("JANUS_REWARD_WEIGHTING", "paper").lower()
+        variance_mix = float(os.environ.get("JANUS_REWARD_VARIANCE_MIX", "0.5"))
+        reasoning_observed_mask = (
+            _gather_reasoning_observed_mask(self, samples)
+            if weighting_mode == "stabilized"
+            else None
+        )
         raw = rewards[:, indices]
-        contributions, weights = variance_weighted_components(raw, num_generations, priors)
+        contributions, weights = variance_weighted_components(
+            raw,
+            num_generations,
+            priors,
+            mode=weighting_mode,
+            reasoning_observed_mask=reasoning_observed_mask,
+            variance_mix=variance_mix,
+        )
+        dispersions = reward_weighting_dispersions(
+            raw,
+            num_generations,
+            mode=weighting_mode,
+            reasoning_observed_mask=reasoning_observed_mask,
+        )
         rewards = rewards.clone()
         rewards[:, indices] = contributions
         self._janus_component_indices = indices
@@ -700,7 +825,29 @@ def _install_group_level_hooks() -> None:
         for component_index, component in enumerate(COMPONENT_ORDER):
             self._metrics[mode][f"janus/raw_{component}"].append(raw[:, component_index].mean().item())
             self._metrics[mode][f"janus/weight_{component}"].append(weights[:, component_index].mean().item())
+            self._metrics[mode][f"janus/prior_{component}"].append(priors[component_index].item())
+            self._metrics[mode][f"diagnostics/{component}_weighting_dispersion_mean"].append(
+                dispersions[:, component_index].mean().item()
+            )
+        self._metrics[mode]["janus/reward_variance_mix"].append(
+            variance_mix if weighting_mode == "stabilized" else 1.0
+        )
+        self._metrics[mode]["janus/reward_weighting_stabilized"].append(
+            float(weighting_mode == "stabilized")
+        )
+        if reasoning_observed_mask is not None:
+            self._metrics[mode]["diagnostics/reasoning_reward_judged_fraction"].append(
+                reasoning_observed_mask.float().mean().item()
+            )
         self._metrics[mode]["janus/kl_beta"].append(float(self.beta))
+        if not hasattr(self, "_janus_reward_weighting_logged"):
+            logger.info(
+                "Janus reward weighting: mode=%s variance_mix=%.3f ranges=%s",
+                weighting_mode,
+                variance_mix,
+                COMPONENT_RANGES,
+            )
+            self._janus_reward_weighting_logged = True
         return rewards
 
     def score_completions(self, samples):
