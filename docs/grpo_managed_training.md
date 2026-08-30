@@ -49,9 +49,15 @@ boundary the canonical event files are rebuilt from them, eliminating duplicate
 future steps left by an interrupted attempt. Resource monitoring continues its
 event step counter across segment restarts.
 
-`scripts/run_tensorboard.sh` defaults to a scoped server with only `train`,
-`val`, and `resources`. Old smoke/aborted runs remain on disk for audit but are
-not loaded. Set `JANUS_TENSORBOARD_ALL_RUNS=1` only for deliberate comparison.
+`scripts/run_tensorboard.sh` defaults to a scoped server with only `train` and
+`val`. It enables TensorBoard's multi-file reload so checkpoint resumes can
+rotate the canonical event files without leaving the live dashboard attached
+to an obsolete file. The launcher also refreshes the TensorBoard child process
+when the event filename set changes, clearing cached files from the preceding
+segment instead of accumulating duplicate history. Resource events remain on
+disk and can be included with `JANUS_TENSORBOARD_INCLUDE_RESOURCES=1`. Old
+smoke/aborted runs remain on disk for audit but are not loaded. Set
+`JANUS_TENSORBOARD_ALL_RUNS=1` only for deliberate comparison.
 
 ## Launch
 
