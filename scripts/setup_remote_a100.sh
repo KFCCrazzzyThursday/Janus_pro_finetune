@@ -24,7 +24,7 @@ if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
 fi
 
 "${VENV_DIR}/bin/python" -m pip --isolated install --upgrade \
-  --index-url https://pypi.org/simple pip setuptools wheel
+  --index-url https://pypi.org/simple pip setuptools==80.9.0 wheel
 "${VENV_DIR}/bin/python" -m pip --isolated install \
   --index-url https://pypi.org/simple numpy==1.26.4 pillow==11.3.0
 echo "Installing the CUDA 12.4 PyTorch build for A100 GPUs."

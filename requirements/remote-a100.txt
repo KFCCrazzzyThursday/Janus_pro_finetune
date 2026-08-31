@@ -26,7 +26,9 @@ safetensors==0.8.0
 scipy==1.15.3
 sentencepiece==0.2.2
 # TensorBoard 2.15 is the final line compatible with the image's protobuf
-# 3.20 ONNX stack; event files remain readable by newer clients.
+# 3.20 ONNX stack; event files remain readable by newer clients. It imports
+# pkg_resources, which was removed from newer setuptools releases.
+setuptools==80.9.0
 tensorboard==2.15.2
 timm==1.0.28
 tokenizers==0.22.2
