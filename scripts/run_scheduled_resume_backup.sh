@@ -11,6 +11,8 @@ SECRET_ENV="${JANUS_BACKUP_SECRET_ENV:-/dev/shm/janus-scheduled-backup.env}"
 SNAPSHOT_ROOT="${JANUS_BACKUP_SNAPSHOT_ROOT:-${RUN_DIR}/scheduled_backups}"
 LOG_DIR="${SNAPSHOT_ROOT}/logs"
 LOCK_FILE="${SNAPSHOT_ROOT}/.${BACKUP_ID}.scheduler.lock"
+MAX_ATTEMPTS="${JANUS_BACKUP_MAX_ATTEMPTS:-6}"
+RETRY_SECONDS="${JANUS_BACKUP_RETRY_SECONDS:-600}"
 
 mkdir -p "${LOG_DIR}"
 exec 9>"${LOCK_FILE}"
@@ -43,13 +45,32 @@ for source in \
   [[ -f "${source}" ]] && DATA_ARGS+=(--data-file "${source}")
 done
 
-exec "${PYTHON_ENV}/bin/python" "${ROOT_DIR}/scripts/snapshot_and_upload_resume.py" \
-  --repo-dir "${ROOT_DIR}" \
-  --run-dir "${RUN_DIR}" \
-  --snapshot-root "${SNAPSHOT_ROOT}" \
-  --backup-id "${BACKUP_ID}" \
-  --world-size "${JANUS_NPROC_PER_NODE:-2}" \
-  --github-branch "${GITHUB_BRANCH}" \
-  --hf-repo-id "${JANUS_HF_REPO_ID:-}" \
-  --hf-revision "${JANUS_HF_REVISION:-backup/a100-resume-20260901-1000-cst}" \
+BACKUP_COMMAND=(
+  "${PYTHON_ENV}/bin/python"
+  "${ROOT_DIR}/scripts/snapshot_and_upload_resume.py"
+  --repo-dir "${ROOT_DIR}"
+  --run-dir "${RUN_DIR}"
+  --snapshot-root "${SNAPSHOT_ROOT}"
+  --backup-id "${BACKUP_ID}"
+  --world-size "${JANUS_NPROC_PER_NODE:-2}"
+  --github-branch "${GITHUB_BRANCH}"
+  --hf-repo-id "${JANUS_HF_REPO_ID:-}"
+  --hf-revision "${JANUS_HF_REVISION:-backup/a100-resume-20260901-1000-cst}"
   "${DATA_ARGS[@]}"
+)
+
+for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
+  echo "$(date -u '+%FT%TZ') starting backup attempt ${attempt}/${MAX_ATTEMPTS}."
+  if "${BACKUP_COMMAND[@]}"; then
+    echo "$(date -u '+%FT%TZ') scheduled backup completed successfully."
+    exit 0
+  else
+    status=$?
+  fi
+  if (( attempt == MAX_ATTEMPTS )); then
+    echo "$(date -u '+%FT%TZ') backup failed after ${MAX_ATTEMPTS} attempts." >&2
+    exit "${status}"
+  fi
+  echo "$(date -u '+%FT%TZ') attempt ${attempt} failed with status ${status}; retrying in ${RETRY_SECONDS}s." >&2
+  sleep "${RETRY_SECONDS}"
+done

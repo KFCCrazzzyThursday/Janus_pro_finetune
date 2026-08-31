@@ -53,7 +53,8 @@ manifest 校验**的 checkpoint。对不可变 checkpoint 使用硬链接建立�
 
 Hugging Face 使用可断点续传的 `upload_large_folder`。上传完成后脚本重新列出远端文件，确认
 adapter、optimizer、scheduler、trainer state 和所有 rank RNG 文件均存在，才写入成功回执。
-上传中断时，本地一致性快照和 HF 上传缓存都会保留，可直接重跑同一任务继续。
+上传中断时，本地一致性快照和 HF 上传缓存都会保留；定时包装脚本默认每 10 分钟重试一次、
+最多尝试 6 次，重跑时复用同一个快照和 revision，不重复占用 checkpoint 空间。
 
 ## 恢复方式与限制
 
