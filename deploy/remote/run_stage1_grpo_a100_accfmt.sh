@@ -9,6 +9,12 @@ export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${ROOT_DIR}/.cache}"
 export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-${XDG_CACHE_HOME}/modelscope}"
 export TORCH_HOME="${TORCH_HOME:-${XDG_CACHE_HOME}/torch}"
 export TMPDIR="${TMPDIR:-${ROOT_DIR}/.tmp}"
+# PyTorch 2.6 defaults torch.load() to weights_only=True. Transformers loads
+# RNG state without an explicit mode, while checkpoint-270 contains the normal
+# NumPy/Python RNG tuple produced by the older training host. The transferred
+# checkpoint is hash-verified and trusted, so permit that full RNG-state load
+# to preserve exact continuation instead of silently reseeding the run.
+export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD="${TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD:-1}"
 
 export JANUS_CUDA_VISIBLE_DEVICES="${JANUS_CUDA_VISIBLE_DEVICES:-0,1}"
 export JANUS_NPROC_PER_NODE="${JANUS_NPROC_PER_NODE:-2}"
