@@ -15,6 +15,7 @@ from scienceqa_grpo import (  # noqa: E402
     JanusReasoningReward,
     _component_indices,
     _scheduled_reward_priors,
+    accuracy_format_monitoring_metrics,
     population_advantages,
     reward_monitoring_metrics,
     reward_weighting_dispersions,
@@ -30,6 +31,22 @@ def test_accuracy_format_ablation_uses_native_grpo_combination() -> None:
         ]
     )
     assert _component_indices(trainer) is None
+
+
+def test_accuracy_format_ablation_keeps_exact_dashboard_rates() -> None:
+    rewards = torch.tensor(
+        [
+            [1.0, 1.0],
+            [0.0, 1.0],
+            [-1.0, 0.5],
+            [1.0, 0.0],
+        ]
+    )
+
+    metrics = accuracy_format_monitoring_metrics(rewards, 0, 1)
+
+    assert metrics["diagnostics/correct_completion_fraction"] == 0.5
+    assert metrics["diagnostics/strict_format_fraction"] == 0.5
 
 
 def test_other_partial_janus_reward_sets_remain_rejected() -> None:

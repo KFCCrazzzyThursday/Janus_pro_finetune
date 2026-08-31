@@ -944,7 +944,7 @@ def _scheduled_reward_priors(trainer) -> torch.Tensor:
     )
 
 
-def _component_indices(trainer) -> list[int] | None:
+def _janus_component_positions(trainer) -> dict[str, int]:
     positions: dict[str, int] = {}
     for index, reward_func in enumerate(trainer.reward_funcs):
         component = getattr(reward_func, "janus_component", None)
@@ -952,6 +952,11 @@ def _component_indices(trainer) -> list[int] | None:
             if component in positions:
                 raise RuntimeError(f"Duplicate Janus reward component: {component}")
             positions[component] = index
+    return positions
+
+
+def _component_indices(trainer) -> list[int] | None:
+    positions = _janus_component_positions(trainer)
     if not positions:
         return None
     # Accuracy+format is an intentional ablation. Let ms-swift's native GRPO
@@ -963,6 +968,24 @@ def _component_indices(trainer) -> list[int] | None:
     if missing:
         raise RuntimeError(f"Incomplete Janus reward set; missing {sorted(missing)}")
     return [positions[name] for name in COMPONENT_ORDER]
+
+
+def accuracy_format_monitoring_metrics(
+    rewards: torch.Tensor,
+    accuracy_index: int,
+    format_index: int,
+) -> dict[str, float]:
+    """Keep exact live rates visible without changing native reward weighting."""
+    if rewards.ndim != 2:
+        raise ValueError(f"expected a two-dimensional reward tensor, got {rewards.shape}")
+    return {
+        "diagnostics/correct_completion_fraction": (
+            rewards[:, accuracy_index] >= 1.0 - 1e-6
+        ).float().mean().item(),
+        "diagnostics/strict_format_fraction": (
+            rewards[:, format_index] >= 1.0 - 1e-6
+        ).float().mean().item(),
+    }
 
 
 def _learning_group_mask(samples: Sequence[Any], num_generations: int, device: torch.device) -> torch.Tensor:
@@ -1040,8 +1063,18 @@ def _install_group_level_hooks() -> None:
 
     def compute_rewards_per_func(self, samples):
         rewards = original_rewards(self, samples)
+        positions = _janus_component_positions(self)
         indices = _component_indices(self)
         if indices is None:
+            if set(positions) == {"accuracy", "format"}:
+                mode = "train" if self.model.training else "eval"
+                monitoring = accuracy_format_monitoring_metrics(
+                    rewards,
+                    positions["accuracy"],
+                    positions["format"],
+                )
+                for name, value in monitoring.items():
+                    self._metrics[mode][name].append(value)
             return rewards
         selected_weights = self.reward_weights[indices]
         if not torch.allclose(selected_weights, torch.ones_like(selected_weights)):
