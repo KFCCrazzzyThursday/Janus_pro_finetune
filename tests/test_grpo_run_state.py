@@ -11,6 +11,9 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 from scripts.grpo_run_state import (
     MANIFEST_NAME,
     migrate_checkpoint_rng_world_size,
+    load_tensorboard_validation_history,
+    merge_training_history,
+    overlay_imported_tensorboard,
     prepare_resume,
     record_validation,
     verify_checkpoint,
@@ -141,6 +144,34 @@ def test_prepare_resume_trims_partial_metrics_and_rebuilds_tensorboard(tmp_path)
     assert [item.step for item in accumulator.Scalars("train/reward")] == [29, 30]
 
 
+def test_prepare_resume_splices_imported_training_history(tmp_path):
+    checkpoint = make_checkpoint(tmp_path, 30)
+    verify_checkpoint(checkpoint, 2, write_manifest=True)
+    imported = tmp_path / "tensorboard_imports" / "training" / "l40s.jsonl"
+    imported.parent.mkdir(parents=True)
+    imported.write_text(
+        "".join(
+            json.dumps({"global_step/max_steps": f"{step}/30", "reward": step / 10}) + "\n"
+            for step in (1, 2)
+        )
+    )
+    (tmp_path / "logging.jsonl").write_text(
+        json.dumps({"global_step/max_steps": "30/60", "reward": 3.0}) + "\n"
+    )
+
+    prepare_resume(tmp_path, 2)
+
+    assert [row["global_step/max_steps"] for row in merge_training_history(tmp_path, 30)] == [
+        "1/30",
+        "2/30",
+        "30/60",
+    ]
+    event = next((tmp_path / "runs" / "trainer").glob("events.out.tfevents.*"))
+    accumulator = EventAccumulator(str(event))
+    accumulator.Reload()
+    assert [item.step for item in accumulator.Scalars("train/reward")] == [1, 2, 30]
+
+
 def test_validation_history_promotes_best_full_checkpoint(tmp_path):
     first = make_checkpoint(tmp_path, 30)
     second = make_checkpoint(tmp_path, 60)
@@ -163,6 +194,53 @@ def test_validation_history_promotes_best_full_checkpoint(tmp_path):
         for line in (tmp_path / "validation" / "history.jsonl").read_text().splitlines()
     ]
     assert [row["step"] for row in history] == [30, 60]
+
+
+def test_imported_validation_is_display_only_for_best_selection(tmp_path):
+    checkpoint = make_checkpoint(tmp_path, 30)
+    imported = tmp_path / "tensorboard_imports" / "validation" / "l40s.jsonl"
+    imported.parent.mkdir(parents=True)
+    imported.write_text(
+        json.dumps(
+            {
+                "step": 20,
+                "accuracy": 0.99,
+                "strict_format_rate": 0.9,
+                "parse_failure_rate": 0.01,
+            }
+        )
+        + "\n"
+    )
+    summary = write_summary(
+        tmp_path / "validation" / "30" / "summary.json", checkpoint, 0.6
+    )
+
+    best = record_validation(checkpoint, summary, 2)
+
+    assert best["step"] == 30
+    assert [row["step"] for row in load_tensorboard_validation_history(tmp_path)] == [20, 30]
+    event = next((tmp_path / "runs" / "validation").glob("events.out.tfevents.*"))
+    accumulator = EventAccumulator(str(event))
+    accumulator.Reload()
+    assert [item.step for item in accumulator.Scalars("val/accuracy")] == [20, 30]
+
+
+def test_import_overlay_preserves_live_tensorboard_event(tmp_path):
+    imported = tmp_path / "tensorboard_imports" / "training" / "l40s.jsonl"
+    imported.parent.mkdir(parents=True)
+    imported.write_text(
+        json.dumps({"global_step/max_steps": "1/30", "reward": 0.1}) + "\n"
+    )
+    live_dir = tmp_path / "runs" / "trainer"
+    live_dir.mkdir(parents=True)
+    live_event = live_dir / "events.out.tfevents.live"
+    live_event.write_bytes(b"live-writer-placeholder")
+
+    result = overlay_imported_tensorboard(tmp_path, 30)
+
+    assert result == {"training_rows": 1, "validation_rows": 0}
+    assert live_event.read_bytes() == b"live-writer-placeholder"
+    assert len(list(live_dir.glob("events.out.tfevents.*.janus-import"))) == 1
 
 
 def test_resource_monitor_resumes_steps_from_csv(tmp_path):

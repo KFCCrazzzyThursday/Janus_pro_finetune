@@ -24,6 +24,8 @@ from typing import Any
 
 CHECKPOINT_RE = re.compile(r"^checkpoint-(\d+)$")
 MANIFEST_NAME = "janus_checkpoint_manifest.json"
+TENSORBOARD_IMPORT_DIR = "tensorboard_imports"
+IMPORT_EVENT_SUFFIX = ".janus-import"
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -326,6 +328,33 @@ def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     atomic_write_text(path, text)
 
 
+def imported_jsonl_paths(run_dir: Path, kind: str) -> list[Path]:
+    directory = run_dir / TENSORBOARD_IMPORT_DIR / kind
+    if not directory.is_dir():
+        return []
+    return sorted(path for path in directory.glob("*.jsonl") if path.is_file())
+
+
+def merge_training_history(run_dir: Path, maximum_step: int) -> list[dict[str, Any]]:
+    """Merge canonical and imported metric rows without duplicating rebuilds."""
+    groups = [
+        filtered_jsonl(path, maximum_step)
+        for path in imported_jsonl_paths(run_dir, "training")
+    ]
+    groups.append(filtered_jsonl(run_dir / "logging.jsonl", maximum_step))
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in groups:
+        for row in group:
+            identity = json.dumps(row, sort_keys=True, ensure_ascii=False)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            rows.append(row)
+    rows.sort(key=lambda row: row_step(row) or 0)
+    return rows
+
+
 def clear_event_files(directory: Path) -> None:
     if not directory.exists():
         return
@@ -334,13 +363,16 @@ def clear_event_files(directory: Path) -> None:
             event.unlink()
 
 
-def rebuild_training_tensorboard(run_dir: Path, rows: list[dict[str, Any]]) -> None:
+def write_training_tensorboard_event(
+    event_dir: Path,
+    rows: list[dict[str, Any]],
+    *,
+    filename_suffix: str = "",
+) -> None:
     from torch.utils.tensorboard import SummaryWriter
 
-    event_dir = run_dir / "runs" / "trainer"
     event_dir.mkdir(parents=True, exist_ok=True)
-    clear_event_files(event_dir)
-    with SummaryWriter(log_dir=str(event_dir)) as writer:
+    with SummaryWriter(log_dir=str(event_dir), filename_suffix=filename_suffix) as writer:
         for row in rows:
             step = row_step(row)
             if step is None:
@@ -355,12 +387,40 @@ def rebuild_training_tensorboard(run_dir: Path, rows: list[dict[str, Any]]) -> N
         writer.flush()
 
 
+def rebuild_training_tensorboard(run_dir: Path, rows: list[dict[str, Any]]) -> None:
+    event_dir = run_dir / "runs" / "trainer"
+    event_dir.mkdir(parents=True, exist_ok=True)
+    clear_event_files(event_dir)
+    write_training_tensorboard_event(event_dir, rows)
+
+
 def load_validation_history(run_dir: Path) -> list[dict[str, Any]]:
     path = run_dir / "validation" / "history.jsonl"
     if not path.is_file():
         return []
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     by_step = {int(row["step"]): row for row in rows}
+    return [by_step[step] for step in sorted(by_step)]
+
+
+def load_imported_validation_history(run_dir: Path) -> list[dict[str, Any]]:
+    by_step: dict[int, dict[str, Any]] = {}
+    for path in imported_jsonl_paths(run_dir, "validation"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            by_step[int(row["step"])] = row
+    return [by_step[step] for step in sorted(by_step)]
+
+
+def load_tensorboard_validation_history(run_dir: Path) -> list[dict[str, Any]]:
+    # Imported rows are display-only: current-run validation wins at duplicate
+    # steps and remains the sole source for best-checkpoint selection.
+    by_step = {
+        int(row["step"]): row for row in load_imported_validation_history(run_dir)
+    }
+    by_step.update({int(row["step"]): row for row in load_validation_history(run_dir)})
     return [by_step[step] for step in sorted(by_step)]
 
 
@@ -387,18 +447,75 @@ def rebuild_validation_tensorboard(run_dir: Path, rows: list[dict[str, Any]]) ->
         writer.flush()
 
 
+def overlay_imported_tensorboard(run_dir: Path, maximum_step: int) -> dict[str, int]:
+    """Add imported history beside a live writer without touching live events."""
+    training_rows: list[dict[str, Any]] = []
+    for path in imported_jsonl_paths(run_dir, "training"):
+        training_rows.extend(filtered_jsonl(path, maximum_step))
+
+    current_validation_steps = {
+        int(row["step"]) for row in load_validation_history(run_dir)
+    }
+    validation_rows = [
+        row
+        for row in load_imported_validation_history(run_dir)
+        if int(row["step"]) <= maximum_step
+        and int(row["step"]) not in current_validation_steps
+    ]
+
+    trainer_dir = run_dir / "runs" / "trainer"
+    validation_dir = run_dir / "runs" / "validation"
+    trainer_dir.mkdir(parents=True, exist_ok=True)
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    for directory in (trainer_dir, validation_dir):
+        for event in directory.glob(f"events.out.tfevents.*{IMPORT_EVENT_SUFFIX}"):
+            event.unlink()
+    if training_rows:
+        write_training_tensorboard_event(
+            trainer_dir,
+            training_rows,
+            filename_suffix=IMPORT_EVENT_SUFFIX,
+        )
+    if validation_rows:
+        from torch.utils.tensorboard import SummaryWriter
+
+        with SummaryWriter(
+            log_dir=str(validation_dir), filename_suffix=IMPORT_EVENT_SUFFIX
+        ) as writer:
+            for row in validation_rows:
+                step = int(row["step"])
+                for name in (
+                    "accuracy",
+                    "strict_format_rate",
+                    "parse_failure_rate",
+                    "mean_completion_tokens",
+                    "mean_reasoning_tokens",
+                    "runtime_seconds",
+                ):
+                    value = row.get(name)
+                    if isinstance(value, (int, float)):
+                        writer.add_scalar(f"val/{name}", value, step)
+            writer.flush()
+    return {
+        "training_rows": len(training_rows),
+        "validation_rows": len(validation_rows),
+    }
+
+
 def prepare_resume(run_dir: Path, world_size: int) -> dict[str, Any]:
     state = write_resume_state(run_dir, world_size)
     latest_value = state.get("latest_checkpoint")
     if not latest_value:
         return state
     maximum_step = int(state["latest_step"])
-    logging_rows = filtered_jsonl(run_dir / "logging.jsonl", maximum_step)
+    logging_rows = merge_training_history(run_dir, maximum_step)
     completion_rows = filtered_jsonl(run_dir / "completions.jsonl", maximum_step)
     write_jsonl(run_dir / "logging.jsonl", logging_rows)
     write_jsonl(run_dir / "completions.jsonl", completion_rows)
     rebuild_training_tensorboard(run_dir, logging_rows)
-    rebuild_validation_tensorboard(run_dir, load_validation_history(run_dir))
+    rebuild_validation_tensorboard(
+        run_dir, load_tensorboard_validation_history(run_dir)
+    )
     return state
 
 
@@ -485,7 +602,9 @@ def record_validation(
         replace_symlink(run_dir / "best-checkpoint", best_checkpoint)
     best_payload = {**best, "best_checkpoint": str(best_checkpoint)}
     atomic_write_json(run_dir / "best.json", best_payload)
-    rebuild_validation_tensorboard(run_dir, history)
+    rebuild_validation_tensorboard(
+        run_dir, load_tensorboard_validation_history(run_dir)
+    )
     write_resume_state(run_dir, world_size)
     return best_payload
 
@@ -519,6 +638,10 @@ def build_parser() -> argparse.ArgumentParser:
     rebuild = subparsers.add_parser("rebuild-tensorboard")
     rebuild.add_argument("run_dir", type=Path)
     rebuild.add_argument("--world-size", type=int, default=5)
+
+    overlay = subparsers.add_parser("overlay-imported-tensorboard")
+    overlay.add_argument("run_dir", type=Path)
+    overlay.add_argument("--maximum-step", type=int, required=True)
     return parser
 
 
@@ -548,6 +671,12 @@ def main() -> int:
         return 0
     if args.command == "record-validation":
         result = record_validation(args.checkpoint, args.summary, args.world_size)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "overlay-imported-tensorboard":
+        result = overlay_imported_tensorboard(
+            args.run_dir.resolve(), args.maximum_step
+        )
         print(json.dumps(result, sort_keys=True))
         return 0
     raise AssertionError(args.command)
