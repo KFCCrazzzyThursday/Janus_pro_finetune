@@ -28,6 +28,7 @@ TENSORBOARD_IMPORT_DIR = "tensorboard_imports"
 IMPORT_EVENT_SUFFIX = ".janus-import"
 DASHBOARD_EVENT_SUFFIX = ".janus-dashboard"
 DASHBOARD_RUN_DIR = "dashboard"
+ACCFMT_SCHEDULE_NAME = "accfmt_reward_schedule.json"
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -281,8 +282,43 @@ def write_resume_state(run_dir: Path, world_size: int) -> dict[str, Any]:
     best_path = run_dir / "best.json"
     if best_path.is_file():
         state["best"] = json.loads(best_path.read_text())
+    schedule_path = run_dir / ACCFMT_SCHEDULE_NAME
+    if schedule_path.is_file():
+        state["reward_schedule"] = json.loads(schedule_path.read_text())
     atomic_write_json(run_dir / "resume_state.json", state)
     return state
+
+
+def configure_accfmt_schedule(
+    run_dir: Path,
+    first_training_step: int,
+    duration_steps: int,
+    format_start_weight: float,
+    format_end_weight: float,
+) -> dict[str, Any]:
+    if first_training_step < 1:
+        raise ValueError("first_training_step must be positive")
+    if duration_steps < 2:
+        raise ValueError("duration_steps must be at least 2")
+    if not 0.0 <= format_start_weight <= 1.0:
+        raise ValueError("format_start_weight must be in [0, 1]")
+    if not 0.0 <= format_end_weight <= 1.0:
+        raise ValueError("format_end_weight must be in [0, 1]")
+    payload = {
+        "format_version": 1,
+        "schedule": "cosine",
+        "first_training_step": first_training_step,
+        "duration_steps": duration_steps,
+        "last_training_step": first_training_step + duration_steps - 1,
+        "format_start_weight": format_start_weight,
+        "format_end_weight": format_end_weight,
+        "accuracy_start_weight": 1.0 - format_start_weight,
+        "accuracy_end_weight": 1.0 - format_end_weight,
+        "configured_at": time.time(),
+    }
+    run_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(run_dir / ACCFMT_SCHEDULE_NAME, payload)
+    return payload
 
 
 def row_step(row: dict[str, Any]) -> int | None:
@@ -810,6 +846,13 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard = subparsers.add_parser("stream-tensorboard-dashboard")
     dashboard.add_argument("run_dir", type=Path)
     dashboard.add_argument("--poll-seconds", type=float, default=2.0)
+
+    schedule = subparsers.add_parser("configure-accfmt-schedule")
+    schedule.add_argument("run_dir", type=Path)
+    schedule.add_argument("--first-training-step", type=int, required=True)
+    schedule.add_argument("--duration-steps", type=int, required=True)
+    schedule.add_argument("--format-start-weight", type=float, required=True)
+    schedule.add_argument("--format-end-weight", type=float, required=True)
     return parser
 
 
@@ -849,6 +892,16 @@ def main() -> int:
         return 0
     if args.command == "stream-tensorboard-dashboard":
         stream_tensorboard_dashboard(args.run_dir.resolve(), args.poll_seconds)
+        return 0
+    if args.command == "configure-accfmt-schedule":
+        result = configure_accfmt_schedule(
+            args.run_dir.resolve(),
+            args.first_training_step,
+            args.duration_steps,
+            args.format_start_weight,
+            args.format_end_weight,
+        )
+        print(json.dumps(result, sort_keys=True))
         return 0
     raise AssertionError(args.command)
 

@@ -36,6 +36,7 @@ from janus_repro.rewards import accuracy_reward, format_reward, length_reward, p
 
 logger = get_logger()
 COMPONENT_ORDER = ("accuracy", "length", "format", "reasoning")
+ACCFMT_SCHEDULE_NAME = "accfmt_reward_schedule.json"
 # Theoretical component ranges. Accuracy is -1/0/+1; the other three
 # components are bounded in [0, 1]. These scales are used only to compare
 # dispersion, while the signed raw rewards remain the optimized values.
@@ -988,6 +989,103 @@ def accuracy_format_monitoring_metrics(
     }
 
 
+def cosine_accuracy_format_weights(
+    training_step: int,
+    first_training_step: int,
+    duration_steps: int,
+    format_start_weight: float,
+    format_end_weight: float,
+) -> tuple[float, float, float]:
+    """Return complementary accuracy/format weights for an inclusive schedule."""
+    if first_training_step < 1:
+        raise ValueError("first_training_step must be positive")
+    if duration_steps < 2:
+        raise ValueError("duration_steps must be at least 2")
+    if not 0.0 <= format_start_weight <= 1.0:
+        raise ValueError("format_start_weight must be in [0, 1]")
+    if not 0.0 <= format_end_weight <= 1.0:
+        raise ValueError("format_end_weight must be in [0, 1]")
+
+    progress = min(
+        max((training_step - first_training_step) / (duration_steps - 1), 0.0),
+        1.0,
+    )
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    format_weight = format_end_weight + (
+        format_start_weight - format_end_weight
+    ) * cosine
+    return 1.0 - format_weight, format_weight, progress
+
+
+def _accuracy_format_schedule_config(trainer: Any) -> dict[str, Any] | None:
+    cached = getattr(trainer, "_janus_accfmt_schedule_config", None)
+    if cached is not None:
+        return cached
+
+    configured_path = os.environ.get("JANUS_ACCFMT_SCHEDULE_CONFIG")
+    if configured_path:
+        path = Path(configured_path).expanduser().resolve()
+        required = True
+    else:
+        output_dir = getattr(getattr(trainer, "args", None), "output_dir", None)
+        if not output_dir:
+            return None
+        path = Path(output_dir).resolve() / ACCFMT_SCHEDULE_NAME
+        required = False
+    if not path.is_file():
+        if required:
+            raise FileNotFoundError(f"Missing accuracy/format schedule: {path}")
+        return None
+
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if config.get("schedule") != "cosine":
+        raise ValueError(f"Unsupported accuracy/format schedule in {path}: {config}")
+    expected_last = int(config["first_training_step"]) + int(
+        config["duration_steps"]
+    ) - 1
+    if int(config.get("last_training_step", expected_last)) != expected_last:
+        raise ValueError(f"Inconsistent last_training_step in {path}")
+    # Validate every numeric field before caching the configuration.
+    cosine_accuracy_format_weights(
+        int(config["first_training_step"]),
+        int(config["first_training_step"]),
+        int(config["duration_steps"]),
+        float(config["format_start_weight"]),
+        float(config["format_end_weight"]),
+    )
+    normalized = {
+        "path": str(path),
+        "schedule": "cosine",
+        "first_training_step": int(config["first_training_step"]),
+        "duration_steps": int(config["duration_steps"]),
+        "last_training_step": expected_last,
+        "format_start_weight": float(config["format_start_weight"]),
+        "format_end_weight": float(config["format_end_weight"]),
+    }
+    trainer._janus_accfmt_schedule_config = normalized
+    return normalized
+
+
+def scheduled_accuracy_format_weights(
+    trainer: Any,
+) -> tuple[float, float, float, int] | None:
+    config = _accuracy_format_schedule_config(trainer)
+    if config is None:
+        return None
+    # Rewards for optimizer step N are generated while TrainerState still
+    # records N-1. This keeps the configured endpoints aligned with the steps
+    # shown in logging.jsonl and TensorBoard.
+    training_step = int(trainer.state.global_step) + 1
+    accuracy_weight, format_weight, progress = cosine_accuracy_format_weights(
+        training_step,
+        config["first_training_step"],
+        config["duration_steps"],
+        config["format_start_weight"],
+        config["format_end_weight"],
+    )
+    return accuracy_weight, format_weight, progress, training_step
+
+
 def _learning_group_mask(samples: Sequence[Any], num_generations: int, device: torch.device) -> torch.Tensor:
     """Keep mixed and all-wrong groups; discard only mastered groups.
 
@@ -1068,6 +1166,35 @@ def _install_group_level_hooks() -> None:
         if indices is None:
             if set(positions) == {"accuracy", "format"}:
                 mode = "train" if self.model.training else "eval"
+                scheduled_weights = scheduled_accuracy_format_weights(self)
+                if scheduled_weights is not None:
+                    accuracy_weight, format_weight, progress, training_step = (
+                        scheduled_weights
+                    )
+                    self.reward_weights[positions["accuracy"]] = accuracy_weight
+                    self.reward_weights[positions["format"]] = format_weight
+                    self._metrics[mode]["reward_schedule/accuracy_weight"].append(
+                        accuracy_weight
+                    )
+                    self._metrics[mode]["reward_schedule/format_weight"].append(
+                        format_weight
+                    )
+                    self._metrics[mode]["reward_schedule/progress"].append(progress)
+                    self._metrics[mode]["reward_schedule/training_step"].append(
+                        float(training_step)
+                    )
+                    if not hasattr(self, "_janus_accfmt_schedule_logged"):
+                        config = self._janus_accfmt_schedule_config
+                        logger.info(
+                            "Accuracy/format cosine schedule: steps %d-%d, "
+                            "format %.4f->%.4f (%s)",
+                            config["first_training_step"],
+                            config["last_training_step"],
+                            config["format_start_weight"],
+                            config["format_end_weight"],
+                            config["path"],
+                        )
+                        self._janus_accfmt_schedule_logged = True
                 monitoring = accuracy_format_monitoring_metrics(
                     rewards,
                     positions["accuracy"],

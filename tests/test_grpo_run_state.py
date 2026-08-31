@@ -11,6 +11,7 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 from scripts.grpo_run_state import (
     MANIFEST_NAME,
     coalesce_training_history,
+    configure_accfmt_schedule,
     load_tensorboard_validation_history,
     merge_training_history,
     migrate_checkpoint_rng_world_size,
@@ -77,6 +78,19 @@ def test_checkpoint_manifest_and_latest_fallback(tmp_path):
     fallback = write_resume_state(tmp_path, 2)
     assert fallback["latest_step"] == 30
     assert fallback["invalid_checkpoints"][0]["checkpoint"] == str(latest.resolve())
+
+
+def test_configure_accfmt_schedule_is_persisted_in_resume_state(tmp_path):
+    checkpoint = make_checkpoint(tmp_path, 330)
+    verify_checkpoint(checkpoint, 2, write_manifest=True)
+
+    schedule = configure_accfmt_schedule(tmp_path, 331, 1200, 0.75, 0.25)
+    state = write_resume_state(tmp_path, 2)
+
+    assert schedule["last_training_step"] == 1530
+    assert schedule["accuracy_start_weight"] == 0.25
+    assert schedule["accuracy_end_weight"] == 0.75
+    assert state["reward_schedule"] == schedule
 
 
 def test_migrate_rng_world_size_breaks_hardlinks_and_rewrites_manifest(tmp_path):

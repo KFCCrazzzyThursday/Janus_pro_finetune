@@ -16,9 +16,11 @@ from scienceqa_grpo import (  # noqa: E402
     _component_indices,
     _scheduled_reward_priors,
     accuracy_format_monitoring_metrics,
+    cosine_accuracy_format_weights,
     population_advantages,
     reward_monitoring_metrics,
     reward_weighting_dispersions,
+    scheduled_accuracy_format_weights,
     variance_weighted_components,
 )
 
@@ -47,6 +49,46 @@ def test_accuracy_format_ablation_keeps_exact_dashboard_rates() -> None:
 
     assert metrics["diagnostics/correct_completion_fraction"] == 0.5
     assert metrics["diagnostics/strict_format_fraction"] == 0.5
+
+
+def test_accuracy_format_cosine_schedule_has_inclusive_endpoints() -> None:
+    accuracy, format_weight, progress = cosine_accuracy_format_weights(
+        331, 331, 1200, 0.75, 0.25
+    )
+    assert (accuracy, format_weight, progress) == (0.25, 0.75, 0.0)
+
+    accuracy, format_weight, progress = cosine_accuracy_format_weights(
+        1530, 331, 1200, 0.75, 0.25
+    )
+    assert math.isclose(accuracy, 0.75)
+    assert math.isclose(format_weight, 0.25)
+    assert progress == 1.0
+
+    _, left_midpoint, _ = cosine_accuracy_format_weights(
+        930, 331, 1200, 0.75, 0.25
+    )
+    _, right_midpoint, _ = cosine_accuracy_format_weights(
+        931, 331, 1200, 0.75, 0.25
+    )
+    assert math.isclose((left_midpoint + right_midpoint) / 2, 0.5)
+
+
+def test_accuracy_format_schedule_loads_from_run_directory(tmp_path) -> None:
+    config = {
+        "schedule": "cosine",
+        "first_training_step": 331,
+        "duration_steps": 1200,
+        "last_training_step": 1530,
+        "format_start_weight": 0.75,
+        "format_end_weight": 0.25,
+    }
+    (tmp_path / "accfmt_reward_schedule.json").write_text(json.dumps(config))
+    trainer = SimpleNamespace(
+        args=SimpleNamespace(output_dir=str(tmp_path)),
+        state=SimpleNamespace(global_step=330),
+    )
+
+    assert scheduled_accuracy_format_weights(trainer) == (0.25, 0.75, 0.0, 331)
 
 
 def test_other_partial_janus_reward_sets_remain_rejected() -> None:

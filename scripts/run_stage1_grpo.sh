@@ -70,6 +70,11 @@ if (( ${#GRPO_REWARD_FUNCS[@]} != ${#GRPO_REWARD_WEIGHTS[@]} )); then
   exit 2
 fi
 
+ACCFMT_SCHEDULE_CONFIG="${JANUS_ACCFMT_SCHEDULE_CONFIG:-${OUTPUT_DIR}/accfmt_reward_schedule.json}"
+if [[ -f "${ACCFMT_SCHEDULE_CONFIG}" ]]; then
+  export JANUS_ACCFMT_SCHEDULE_CONFIG="${ACCFMT_SCHEDULE_CONFIG}"
+fi
+
 REASONING_REWARD_ENABLED=0
 for reward_func in "${GRPO_REWARD_FUNCS[@]}"; do
   if [[ "${reward_func}" == "janus_reasoning" ]]; then
@@ -358,6 +363,9 @@ echo "Launching stage-1 TQA GRPO on physical GPUs ${CUDA_VISIBLE_DEVICES}."
 echo "Distributed backend: ${GRPO_BACKEND}"
 echo "Tuner: LoRA (rank=${JANUS_LORA_RANK:-16}, alpha=${JANUS_LORA_ALPHA:-32}, dropout=${JANUS_LORA_DROPOUT:-0.05})"
 echo "Rewards: ${GRPO_REWARD_FUNCS[*]} (weights: ${GRPO_REWARD_WEIGHTS[*]})"
+if [[ -n "${JANUS_ACCFMT_SCHEDULE_CONFIG:-}" ]]; then
+  echo "Accuracy/format reward schedule: ${JANUS_ACCFMT_SCHEDULE_CONFIG}"
+fi
 echo "Reward weighting: ${JANUS_REWARD_WEIGHTING} (variance mix ${JANUS_REWARD_VARIANCE_MIX})"
 echo "Local rollout forward batch: ${SWIFT_TRANSFORMERS_ROLLOUT_BATCH_SIZE}"
 if [[ -n "${RESUME_CHECKPOINT}" ]]; then
