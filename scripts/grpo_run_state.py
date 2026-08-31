@@ -26,6 +26,8 @@ CHECKPOINT_RE = re.compile(r"^checkpoint-(\d+)$")
 MANIFEST_NAME = "janus_checkpoint_manifest.json"
 TENSORBOARD_IMPORT_DIR = "tensorboard_imports"
 IMPORT_EVENT_SUFFIX = ".janus-import"
+DASHBOARD_EVENT_SUFFIX = ".janus-dashboard"
+DASHBOARD_RUN_DIR = "dashboard"
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -387,6 +389,168 @@ def write_training_tensorboard_event(
         writer.flush()
 
 
+def coalesce_training_history(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return one combined row per step for an unambiguous dashboard curve.
+
+    Transformers writes a second train-summary row at the final step of each
+    managed segment. Combining its disjoint fields with the ordinary metric
+    row prevents duplicate scalar points without discarding either set of
+    metrics.
+    """
+    by_step: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        step = row_step(row)
+        if step is None:
+            continue
+        by_step.setdefault(step, {}).update(row)
+    return [by_step[step] for step in sorted(by_step)]
+
+
+def dashboard_training_history(run_dir: Path) -> list[dict[str, Any]]:
+    return coalesce_training_history(merge_training_history(run_dir, 2**63 - 1))
+
+
+def write_scalar_event(
+    writer: Any, step: int, values: Iterable[tuple[str, float]]
+) -> None:
+    from tensorboard.compat.proto.event_pb2 import Event
+    from tensorboard.compat.proto.summary_pb2 import Summary
+
+    summary = Summary(
+        value=[Summary.Value(tag=name, simple_value=value) for name, value in values]
+    )
+    if summary.value:
+        writer.add_event(Event(wall_time=time.time(), step=step, summary=summary))
+
+
+def write_training_row(writer: Any, row: dict[str, Any]) -> None:
+    step = row_step(row)
+    if step is None:
+        return
+    values: list[tuple[str, float]] = []
+    for name, value in row.items():
+        if name in {"step", "global_step/max_steps"}:
+            continue
+        if isinstance(value, bool):
+            value = float(value)
+        if isinstance(value, (int, float)):
+            values.append((f"train/{name}", float(value)))
+    write_scalar_event(writer, step, values)
+
+
+def write_validation_row(writer: Any, row: dict[str, Any]) -> None:
+    step = int(row["step"])
+    values: list[tuple[str, float]] = []
+    for name in (
+        "accuracy",
+        "strict_format_rate",
+        "parse_failure_rate",
+        "mean_completion_tokens",
+        "mean_reasoning_tokens",
+        "runtime_seconds",
+    ):
+        value = row.get(name)
+        if isinstance(value, (int, float)):
+            values.append((f"val/{name}", float(value)))
+    write_scalar_event(writer, step, values)
+
+
+def dashboard_event_dirs(run_dir: Path) -> tuple[Path, Path]:
+    root = run_dir / "runs" / DASHBOARD_RUN_DIR
+    return root / "trainer", root / "validation"
+
+
+def stream_tensorboard_dashboard(run_dir: Path, poll_seconds: float) -> None:
+    """Mirror JSONL metrics into step-ordered event streams for TensorBoard.
+
+    Imported history can be installed while the trainer's SummaryWriter is
+    live. Writing those old steps into the live event directory makes
+    TensorBoard connect the current segment back to step 1. This independent
+    stream starts in sorted order and only appends strictly newer steps. If a
+    resume truncates or changes existing rows, it safely rebuilds the mirror;
+    the trainer event files are never touched.
+    """
+    if poll_seconds <= 0:
+        raise ValueError("poll_seconds must be positive")
+
+    from tensorboard.summary.writer.event_file_writer import EventFileWriter
+
+    trainer_dir, validation_dir = dashboard_event_dirs(run_dir)
+    trainer_dir.mkdir(parents=True, exist_ok=True)
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    train_writer: Any = None
+    validation_writer: Any = None
+    previous_training: dict[int, dict[str, Any]] = {}
+    previous_validation: dict[int, dict[str, Any]] = {}
+
+    try:
+        while True:
+            training_rows = dashboard_training_history(run_dir)
+            validation_rows = load_tensorboard_validation_history(run_dir)
+            training = {int(row_step(row)): row for row in training_rows}
+            validation = {int(row["step"]): row for row in validation_rows}
+
+            rebuild = train_writer is None or validation_writer is None
+            if not rebuild:
+                common_training = previous_training.keys() & training.keys()
+                common_validation = previous_validation.keys() & validation.keys()
+                rebuild = (
+                    not previous_training.keys() <= training.keys()
+                    or not previous_validation.keys() <= validation.keys()
+                    or any(
+                        previous_training[step] != training[step]
+                        for step in common_training
+                    )
+                    or any(
+                        previous_validation[step] != validation[step]
+                        for step in common_validation
+                    )
+                    or any(
+                        step <= max(previous_training, default=-1)
+                        for step in training.keys() - previous_training.keys()
+                    )
+                    or any(
+                        step <= max(previous_validation, default=-1)
+                        for step in validation.keys() - previous_validation.keys()
+                    )
+                )
+
+            if rebuild:
+                if train_writer is not None:
+                    train_writer.close()
+                if validation_writer is not None:
+                    validation_writer.close()
+                clear_event_files(trainer_dir)
+                clear_event_files(validation_dir)
+                unique_suffix = f"{DASHBOARD_EVENT_SUFFIX}-{time.time_ns()}"
+                train_writer = EventFileWriter(
+                    str(trainer_dir), filename_suffix=unique_suffix
+                )
+                validation_writer = EventFileWriter(
+                    str(validation_dir), filename_suffix=unique_suffix
+                )
+                for row in training_rows:
+                    write_training_row(train_writer, row)
+                for row in validation_rows:
+                    write_validation_row(validation_writer, row)
+            else:
+                for step in sorted(training.keys() - previous_training.keys()):
+                    write_training_row(train_writer, training[step])
+                for step in sorted(validation.keys() - previous_validation.keys()):
+                    write_validation_row(validation_writer, validation[step])
+
+            train_writer.flush()
+            validation_writer.flush()
+            previous_training = training
+            previous_validation = validation
+            time.sleep(poll_seconds)
+    finally:
+        if train_writer is not None:
+            train_writer.close()
+        if validation_writer is not None:
+            validation_writer.close()
+
+
 def rebuild_training_tensorboard(run_dir: Path, rows: list[dict[str, Any]]) -> None:
     event_dir = run_dir / "runs" / "trainer"
     event_dir.mkdir(parents=True, exist_ok=True)
@@ -642,6 +806,10 @@ def build_parser() -> argparse.ArgumentParser:
     overlay = subparsers.add_parser("overlay-imported-tensorboard")
     overlay.add_argument("run_dir", type=Path)
     overlay.add_argument("--maximum-step", type=int, required=True)
+
+    dashboard = subparsers.add_parser("stream-tensorboard-dashboard")
+    dashboard.add_argument("run_dir", type=Path)
+    dashboard.add_argument("--poll-seconds", type=float, default=2.0)
     return parser
 
 
@@ -678,6 +846,9 @@ def main() -> int:
             args.run_dir.resolve(), args.maximum_step
         )
         print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "stream-tensorboard-dashboard":
+        stream_tensorboard_dashboard(args.run_dir.resolve(), args.poll_seconds)
         return 0
     raise AssertionError(args.command)
 

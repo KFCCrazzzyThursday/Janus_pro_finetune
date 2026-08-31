@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_ENV="${JANUS_VENV:-/root/.venvs/janus-repro-py312}"
 RUN_DIR="${JANUS_STAGE1_GRPO_OUTPUT:-${ROOT_DIR}/outputs/stage1/tqa_grpo_lora_managed30}"
 EVENT_WATCH_SECONDS="${JANUS_TENSORBOARD_EVENT_WATCH_SECONDS:-5}"
+DASHBOARD_POLL_SECONDS="${JANUS_TENSORBOARD_DASHBOARD_POLL_SECONDS:-2}"
 
 if ! [[ "${EVENT_WATCH_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "JANUS_TENSORBOARD_EVENT_WATCH_SECONDS must be a positive integer." >&2
@@ -17,14 +18,34 @@ fi
 # default: reloading that stream over NFS can delay discovery of a new trainer
 # event file after checkpoint resume. The canonical resource CSV and event data
 # remain on disk and can be enabled explicitly when needed.
-logdir_spec="train:${RUN_DIR}/runs/trainer,val:${RUN_DIR}/runs/validation"
-watched_event_dirs=("${RUN_DIR}/runs/trainer" "${RUN_DIR}/runs/validation")
+dashboard_root="${RUN_DIR}/runs/dashboard"
+logdir_spec="train:${dashboard_root}/trainer,val:${dashboard_root}/validation"
+watched_event_dirs=("${dashboard_root}/trainer" "${dashboard_root}/validation")
 if [[ "${JANUS_TENSORBOARD_INCLUDE_RESOURCES:-0}" == "1" ]]; then
   logdir_spec+=",resources:${RUN_DIR}/runs/resources"
   watched_event_dirs+=("${RUN_DIR}/runs/resources")
 fi
 
 mkdir -p "${watched_event_dirs[@]}"
+
+"${PYTHON_ENV}/bin/python" "${ROOT_DIR}/scripts/grpo_run_state.py" \
+  stream-tensorboard-dashboard "${RUN_DIR}" \
+  --poll-seconds "${DASHBOARD_POLL_SECONDS}" &
+dashboard_pid=$!
+
+# Do not start TensorBoard against an empty mirror during initial backfill.
+for _attempt in {1..60}; do
+  if find "${dashboard_root}/trainer" "${dashboard_root}/validation" \
+      -maxdepth 1 -type f -name 'events.out.tfevents.*' -print -quit \
+      | grep -q .; then
+    break
+  fi
+  if ! kill -0 "${dashboard_pid}" 2>/dev/null; then
+    wait "${dashboard_pid}"
+    exit $?
+  fi
+  sleep 1
+done
 
 event_file_snapshot() {
   find "${watched_event_dirs[@]}" -maxdepth 1 -type f \
@@ -37,6 +58,10 @@ cleanup() {
   if [[ -n "${tensorboard_pid}" ]] && kill -0 "${tensorboard_pid}" 2>/dev/null; then
     kill "${tensorboard_pid}" 2>/dev/null || true
     wait "${tensorboard_pid}" 2>/dev/null || true
+  fi
+  if kill -0 "${dashboard_pid}" 2>/dev/null; then
+    kill "${dashboard_pid}" 2>/dev/null || true
+    wait "${dashboard_pid}" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -62,6 +87,12 @@ while true; do
   restart_requested=0
   while kill -0 "${tensorboard_pid}" 2>/dev/null; do
     sleep "${EVENT_WATCH_SECONDS}"
+    if ! kill -0 "${dashboard_pid}" 2>/dev/null; then
+      echo "TensorBoard dashboard mirror stopped unexpectedly." >&2
+      kill "${tensorboard_pid}" 2>/dev/null || true
+      wait "${tensorboard_pid}" 2>/dev/null || true
+      exit 1
+    fi
     updated_event_files="$(event_file_snapshot)"
     if [[ "${updated_event_files}" != "${event_files}" ]]; then
       echo "TensorBoard event file set changed; restarting the dashboard cache."

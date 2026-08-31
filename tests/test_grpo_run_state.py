@@ -10,9 +10,10 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 
 from scripts.grpo_run_state import (
     MANIFEST_NAME,
-    migrate_checkpoint_rng_world_size,
+    coalesce_training_history,
     load_tensorboard_validation_history,
     merge_training_history,
+    migrate_checkpoint_rng_world_size,
     overlay_imported_tensorboard,
     prepare_resume,
     record_validation,
@@ -241,6 +242,23 @@ def test_import_overlay_preserves_live_tensorboard_event(tmp_path):
     assert result == {"training_rows": 1, "validation_rows": 0}
     assert live_event.read_bytes() == b"live-writer-placeholder"
     assert len(list(live_dir.glob("events.out.tfevents.*.janus-import"))) == 1
+
+
+def test_dashboard_history_is_one_row_per_step_in_order():
+    rows = [
+        {"global_step/max_steps": "271/300", "reward": 0.8, "epoch": 0.4},
+        {"global_step/max_steps": "270/270", "reward": 0.6, "epoch": 0.3},
+        {"global_step/max_steps": "270/270", "train_runtime": 100.0},
+    ]
+
+    combined = coalesce_training_history(rows)
+
+    assert [row["global_step/max_steps"] for row in combined] == [
+        "270/270",
+        "271/300",
+    ]
+    assert combined[0]["reward"] == 0.6
+    assert combined[0]["train_runtime"] == 100.0
 
 
 def test_resource_monitor_resumes_steps_from_csv(tmp_path):
