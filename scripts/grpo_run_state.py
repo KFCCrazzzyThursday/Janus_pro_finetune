@@ -151,6 +151,71 @@ def verify_checkpoint(
     return manifest
 
 
+def migrate_checkpoint_rng_world_size(
+    checkpoint: Path,
+    world_size: int,
+) -> dict[str, Any]:
+    """Adapt a trusted checkpoint's CUDA RNG lists to a smaller world size.
+
+    Transformers stores ``torch.cuda.get_rng_state_all()`` in every per-rank
+    RNG file. Restoring a five-GPU list in a two-GPU process raises inside
+    ``set_rng_state_all`` and silently leaves CUDA reseeded. Imported
+    checkpoints are hash-verified before this migration; every changed file is
+    replaced atomically so hard-linked bootstrap copies remain untouched.
+    """
+    checkpoint = checkpoint.resolve()
+    manifest_path = checkpoint / MANIFEST_NAME
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Checkpoint manifest does not exist: {manifest_path}")
+    existing = json.loads(manifest_path.read_text())
+    source_world_size = int(existing.get("world_size", 0))
+    if source_world_size < 1:
+        raise RuntimeError(f"Invalid manifest world_size: {source_world_size}")
+    if world_size > source_world_size:
+        raise RuntimeError(
+            "Cannot synthesize CUDA RNG states while growing world size: "
+            f"{source_world_size} -> {world_size}"
+        )
+
+    # Verify every source file against its recorded hash before trusting the
+    # pickle payload. PyTorch 2.6 needs weights_only=False for NumPy RNG tuples.
+    verify_checkpoint(checkpoint, source_world_size, write_manifest=False)
+    if world_size == source_world_size:
+        return existing
+
+    import torch
+
+    for rank in range(world_size):
+        path = checkpoint / f"rng_state_{rank}.pth"
+        original_mode = path.stat().st_mode & 0o777
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        cuda_states = state.get("cuda")
+        if not isinstance(cuda_states, (list, tuple)):
+            raise TypeError(f"{path} has no CUDA RNG state list")
+        if len(cuda_states) < world_size:
+            raise RuntimeError(
+                f"{path} has {len(cuda_states)} CUDA states, fewer than {world_size}"
+            )
+        migrated = dict(state)
+        migrated["cuda"] = type(cuda_states)(cuda_states[:world_size])
+
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=checkpoint)
+        os.close(fd)
+        try:
+            torch.save(migrated, temporary)
+            os.chmod(temporary, original_mode)
+            with open(temporary, "rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    return verify_checkpoint(checkpoint, world_size, write_manifest=True)
+
+
 def checkpoint_directories(run_dir: Path) -> list[Path]:
     if not run_dir.is_dir():
         return []
@@ -434,6 +499,10 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--world-size", type=int, default=5)
     verify.add_argument("--write-manifest", action="store_true")
 
+    migrate_rng = subparsers.add_parser("migrate-rng-world-size")
+    migrate_rng.add_argument("checkpoint", type=Path)
+    migrate_rng.add_argument("--world-size", type=int, required=True)
+
     latest = subparsers.add_parser("latest")
     latest.add_argument("run_dir", type=Path)
     latest.add_argument("--world-size", type=int, default=5)
@@ -468,6 +537,10 @@ def main() -> int:
         if not valid:
             return 1
         print(valid[0])
+        return 0
+    if args.command == "migrate-rng-world-size":
+        result = migrate_checkpoint_rng_world_size(args.checkpoint, args.world_size)
+        print(json.dumps(result, sort_keys=True))
         return 0
     if args.command in {"prepare-resume", "rebuild-tensorboard"}:
         state = prepare_resume(args.run_dir.resolve(), args.world_size)

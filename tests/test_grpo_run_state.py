@@ -1,5 +1,7 @@
 import csv
 import json
+import os
+import shutil
 from pathlib import Path
 
 import torch
@@ -8,6 +10,7 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 
 from scripts.grpo_run_state import (
     MANIFEST_NAME,
+    migrate_checkpoint_rng_world_size,
     prepare_resume,
     record_validation,
     verify_checkpoint,
@@ -70,6 +73,36 @@ def test_checkpoint_manifest_and_latest_fallback(tmp_path):
     fallback = write_resume_state(tmp_path, 2)
     assert fallback["latest_step"] == 30
     assert fallback["invalid_checkpoints"][0]["checkpoint"] == str(latest.resolve())
+
+
+def test_migrate_rng_world_size_breaks_hardlinks_and_rewrites_manifest(tmp_path):
+    source = make_checkpoint(tmp_path / "source", 270, world_size=5)
+    for rank in range(5):
+        torch.save(
+            {
+                "python": (rank,),
+                "numpy": (rank,),
+                "cpu": torch.tensor([rank], dtype=torch.uint8),
+                "cuda": [torch.tensor([device], dtype=torch.uint8) for device in range(5)],
+            },
+            source / f"rng_state_{rank}.pth",
+        )
+    verify_checkpoint(source, 5, write_manifest=True)
+
+    destination = tmp_path / "run" / source.name
+    destination.parent.mkdir()
+    shutil.copytree(source, destination, copy_function=os.link)
+    source_rng_hash = (source / "rng_state_0.pth").read_bytes()
+
+    manifest = migrate_checkpoint_rng_world_size(destination, 2)
+
+    assert manifest["world_size"] == 2
+    migrated_cuda = torch.load(
+        destination / "rng_state_0.pth", weights_only=False
+    )["cuda"]
+    assert [item.tolist() for item in migrated_cuda] == [[0], [1]]
+    assert (source / "rng_state_0.pth").read_bytes() == source_rng_hash
+    verify_checkpoint(destination, 2, write_manifest=False)
 
 
 def test_prepare_resume_trims_partial_metrics_and_rebuilds_tensorboard(tmp_path):

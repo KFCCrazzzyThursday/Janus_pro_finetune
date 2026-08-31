@@ -30,6 +30,7 @@ export JANUS_STAGE1_SFT_MODEL="${JANUS_STAGE1_SFT_MODEL:-${ROOT_DIR}/models/Janu
 export JANUS_STAGE1_GRPO_DATA="${JANUS_STAGE1_GRPO_DATA:-${ROOT_DIR}/data/processed/tqa/train_prompt_model_difficulty.remote.jsonl}"
 export JANUS_GRPO_VAL_DATASET="${JANUS_GRPO_VAL_DATASET:-${ROOT_DIR}/data/processed/tqa/val_prompt.remote.jsonl}"
 export JANUS_STAGE1_GRPO_OUTPUT="${JANUS_STAGE1_GRPO_OUTPUT:-${ROOT_DIR}/outputs/stage1/tqa_grpo_accfmt_a100_from270_managed30}"
+export JANUS_GRPO_BOOTSTRAP_CHECKPOINT="${JANUS_GRPO_BOOTSTRAP_CHECKPOINT:-${ROOT_DIR}/bootstrap/checkpoint-270}"
 
 # This continuation phase intentionally makes strict format 75% of the scalar
 # reward coefficients. Accuracy spans [-1, 1], while format spans [0, 1], so
@@ -61,6 +62,27 @@ export JANUS_GRPO_RETRY_MAX_SECONDS="${JANUS_GRPO_RETRY_MAX_SECONDS:-300}"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 mkdir -p "${TMPDIR}" "${XDG_CACHE_HOME}" "${MODELSCOPE_CACHE}" \
   "${TORCH_HOME}" "${JANUS_STAGE1_GRPO_OUTPUT}"
+
+# Seed a new run with the complete imported optimizer/scheduler/RNG state.
+# Hard links avoid spending another ~430 MiB; the migration command uses
+# atomic replacement, so adapting five-GPU RNG files cannot alter bootstrap/.
+BOOTSTRAP_NAME="$(basename "${JANUS_GRPO_BOOTSTRAP_CHECKPOINT}")"
+OUTPUT_BOOTSTRAP="${JANUS_STAGE1_GRPO_OUTPUT}/${BOOTSTRAP_NAME}"
+shopt -s nullglob
+EXISTING_CHECKPOINTS=("${JANUS_STAGE1_GRPO_OUTPUT}"/checkpoint-*)
+shopt -u nullglob
+if (( ${#EXISTING_CHECKPOINTS[@]} == 0 )); then
+  if [[ ! -d "${JANUS_GRPO_BOOTSTRAP_CHECKPOINT}" ]]; then
+    echo "Missing bootstrap checkpoint: ${JANUS_GRPO_BOOTSTRAP_CHECKPOINT}" >&2
+    exit 2
+  fi
+  cp -al "${JANUS_GRPO_BOOTSTRAP_CHECKPOINT}" "${OUTPUT_BOOTSTRAP}"
+fi
+if [[ -d "${OUTPUT_BOOTSTRAP}" ]]; then
+  "${JANUS_VENV}/bin/python" "${ROOT_DIR}/scripts/grpo_run_state.py" \
+    migrate-rng-world-size "${OUTPUT_BOOTSTRAP}" \
+    --world-size "${JANUS_NPROC_PER_NODE}"
+fi
 
 if [[ "${1:-}" == "--managed" ]]; then
   shift
