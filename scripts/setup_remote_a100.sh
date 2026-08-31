@@ -10,6 +10,9 @@ export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${ROOT_DIR}/.pip-cache}"
 export TMPDIR="${TMPDIR:-${ROOT_DIR}/.tmp}"
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+# NVIDIA container images often inject an unreachable NGC extra index. The
+# explicit PyPI index below is sufficient for this userspace-only install.
+unset PIP_EXTRA_INDEX_URL
 mkdir -p "${HF_HOME}" "${HF_XET_CACHE}" "${XDG_CACHE_HOME}" \
   "${PIP_CACHE_DIR}" "${TMPDIR}"
 
