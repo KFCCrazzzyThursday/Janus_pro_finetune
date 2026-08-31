@@ -15,10 +15,10 @@ import socket
 import subprocess
 import sys
 import tempfile
-import time
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,8 +72,7 @@ def run(
         env=env,
         check=False,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
     )
     if check and result.returncode:
         rendered = " ".join(command)
@@ -263,7 +262,9 @@ def refresh_resume_state(run_dir: Path, world_size: int) -> dict[str, Any]:
     return write_resume_state(run_dir, world_size)
 
 
-def unique_checkpoints(state: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], list[Path]]:
+def unique_checkpoints(
+    state: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], list[Path]]:
     roles: dict[str, dict[str, Any]] = {}
     paths_by_step: dict[int, Path] = {}
     candidates = {
@@ -287,7 +288,9 @@ def unique_checkpoints(state: dict[str, Any]) -> tuple[dict[str, dict[str, Any]]
     return roles, [paths_by_step[step] for step in sorted(paths_by_step)]
 
 
-def copy_validation_artifacts(run_dir: Path, destination: Path, steps: Iterable[int]) -> None:
+def copy_validation_artifacts(
+    run_dir: Path, destination: Path, steps: Iterable[int]
+) -> None:
     validation = run_dir / "validation"
     snapshot_file(validation / "history.jsonl", destination / "history.jsonl")
     for step in sorted(set(steps)):
@@ -308,7 +311,9 @@ def environment_metadata() -> dict[str, Any]:
         "hostname": socket.gethostname(),
         "platform": platform.platform(),
         "python": sys.version,
-        "pip_freeze": command_output([sys.executable, "-m", "pip", "freeze"]).splitlines(),
+        "pip_freeze": command_output(
+            [sys.executable, "-m", "pip", "freeze"]
+        ).splitlines(),
         "nvidia_smi": command_output(
             [
                 "nvidia-smi",
@@ -346,7 +351,7 @@ git clone --branch {github_branch} \\
 ```
 
 The primary continuation checkpoint is
-`checkpoints/checkpoint-{latest['step']}`. The bundle also contains the previous
+`checkpoints/checkpoint-{latest["step"]}`. The bundle also contains the previous
 full checkpoint and the best-validation checkpoint when they differ.
 
 ## Resume
@@ -367,9 +372,13 @@ Verify file hashes against `backup_manifest.json` and each checkpoint's
 """
 
 
-def create_snapshot(args: argparse.Namespace, github: dict[str, str]) -> tuple[Path, dict[str, Any]]:
+def create_snapshot(
+    args: argparse.Namespace, github: dict[str, str]
+) -> tuple[Path, dict[str, Any]]:
     snapshot_dir = args.snapshot_root / args.backup_id
-    manifest_path = snapshot_dir / "hf_stage" / "backups" / args.backup_id / "backup_manifest.json"
+    manifest_path = (
+        snapshot_dir / "hf_stage" / "backups" / args.backup_id / "backup_manifest.json"
+    )
     if manifest_path.is_file():
         return snapshot_dir, json.loads(manifest_path.read_text())
 
