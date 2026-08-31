@@ -949,8 +949,15 @@ def _component_indices(trainer) -> list[int] | None:
     for index, reward_func in enumerate(trainer.reward_funcs):
         component = getattr(reward_func, "janus_component", None)
         if component:
+            if component in positions:
+                raise RuntimeError(f"Duplicate Janus reward component: {component}")
             positions[component] = index
     if not positions:
+        return None
+    # Accuracy+format is an intentional ablation. Let ms-swift's native GRPO
+    # path combine these two raw rewards; the four-component thesis weighting,
+    # reasoning observation masks and dense all-wrong-group logic do not apply.
+    if set(positions) == {"accuracy", "format"}:
         return None
     missing = set(COMPONENT_ORDER) - set(positions)
     if missing:

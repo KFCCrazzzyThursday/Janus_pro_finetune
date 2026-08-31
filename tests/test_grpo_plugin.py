@@ -13,12 +13,38 @@ sys.path.insert(0, str(ROOT / "training/plugins"))
 
 from scienceqa_grpo import (  # noqa: E402
     JanusReasoningReward,
+    _component_indices,
     _scheduled_reward_priors,
     population_advantages,
     reward_monitoring_metrics,
     reward_weighting_dispersions,
     variance_weighted_components,
 )
+
+
+def test_accuracy_format_ablation_uses_native_grpo_combination() -> None:
+    trainer = SimpleNamespace(
+        reward_funcs=[
+            SimpleNamespace(janus_component="accuracy"),
+            SimpleNamespace(janus_component="format"),
+        ]
+    )
+    assert _component_indices(trainer) is None
+
+
+def test_other_partial_janus_reward_sets_remain_rejected() -> None:
+    trainer = SimpleNamespace(
+        reward_funcs=[
+            SimpleNamespace(janus_component="accuracy"),
+            SimpleNamespace(janus_component="length"),
+        ]
+    )
+    try:
+        _component_indices(trainer)
+    except RuntimeError as error:
+        assert "Incomplete Janus reward set" in str(error)
+    else:
+        raise AssertionError("unsupported partial reward set was accepted")
 
 
 def test_accuracy_format_priors_follow_post_step30_priority_order(

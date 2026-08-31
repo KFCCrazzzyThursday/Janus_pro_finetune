@@ -59,15 +59,37 @@ if [[ -z "${MODEL_SOURCE_DIR}" ]]; then
   fi
 fi
 
-if (( SMOKE || MEMORY_SMOKE )); then
-  export JANUS_REASONING_JUDGE_SMOKE_STUB=1
+read -r -a GRPO_REWARD_FUNCS <<<"${JANUS_GRPO_REWARD_FUNCS:-janus_accuracy janus_length janus_format janus_reasoning}"
+read -r -a GRPO_REWARD_WEIGHTS <<<"${JANUS_GRPO_REWARD_WEIGHTS:-1 1 1 1}"
+if (( ${#GRPO_REWARD_FUNCS[@]} == 0 )); then
+  echo "JANUS_GRPO_REWARD_FUNCS must select at least one reward." >&2
+  exit 2
+fi
+if (( ${#GRPO_REWARD_FUNCS[@]} != ${#GRPO_REWARD_WEIGHTS[@]} )); then
+  echo "Reward function/weight counts differ: ${#GRPO_REWARD_FUNCS[@]} != ${#GRPO_REWARD_WEIGHTS[@]}." >&2
+  exit 2
+fi
+
+REASONING_REWARD_ENABLED=0
+for reward_func in "${GRPO_REWARD_FUNCS[@]}"; do
+  if [[ "${reward_func}" == "janus_reasoning" ]]; then
+    REASONING_REWARD_ENABLED=1
+    break
+  fi
+done
+if (( REASONING_REWARD_ENABLED )); then
+  if (( SMOKE || MEMORY_SMOKE )); then
+    export JANUS_REASONING_JUDGE_SMOKE_STUB=1
+  else
+    unset JANUS_REASONING_JUDGE_SMOKE_STUB
+    if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+      echo "OPENAI_API_KEY is required because janus_reasoning is selected." >&2
+      echo "Export it in this shell (do not write it into a project file), then rerun." >&2
+      exit 2
+    fi
+  fi
 else
   unset JANUS_REASONING_JUDGE_SMOKE_STUB
-  if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-    echo "OPENAI_API_KEY is required for the configured reasoning reward judge." >&2
-    echo "Export it in this shell (do not write it into a project file), then rerun." >&2
-    exit 2
-  fi
 fi
 
 source "${ROOT_DIR}/scripts/lib/runtime.sh"
@@ -194,8 +216,8 @@ COMMON_ARGS=(
   --dataset_num_proc "${JANUS_GRPO_DATASET_NUM_PROC:-4}"
   --dataloader_num_workers "${JANUS_GRPO_DATALOADER_WORKERS:-2}"
   --external_plugins "${EXTERNAL_PLUGINS[@]}"
-  --reward_funcs janus_accuracy janus_length janus_format janus_reasoning
-  --reward_weights 1 1 1 1
+  --reward_funcs "${GRPO_REWARD_FUNCS[@]}"
+  --reward_weights "${GRPO_REWARD_WEIGHTS[@]}"
   --tuner_type lora
   --target_modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj
   --lora_rank "${JANUS_LORA_RANK:-16}"
@@ -335,6 +357,7 @@ fi
 echo "Launching stage-1 TQA GRPO on physical GPUs ${CUDA_VISIBLE_DEVICES}."
 echo "Distributed backend: ${GRPO_BACKEND}"
 echo "Tuner: LoRA (rank=${JANUS_LORA_RANK:-16}, alpha=${JANUS_LORA_ALPHA:-32}, dropout=${JANUS_LORA_DROPOUT:-0.05})"
+echo "Rewards: ${GRPO_REWARD_FUNCS[*]} (weights: ${GRPO_REWARD_WEIGHTS[*]})"
 echo "Reward weighting: ${JANUS_REWARD_WEIGHTING} (variance mix ${JANUS_REWARD_VARIANCE_MIX})"
 echo "Local rollout forward batch: ${SWIFT_TRANSFORMERS_ROLLOUT_BATCH_SIZE}"
 if [[ -n "${RESUME_CHECKPOINT}" ]]; then
