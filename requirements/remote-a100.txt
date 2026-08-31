@@ -25,7 +25,9 @@ PyYAML==6.0.3
 safetensors==0.8.0
 scipy==1.15.3
 sentencepiece==0.2.2
-tensorboard==2.21.0
+# TensorBoard 2.15 is the final line compatible with the image's protobuf
+# 3.20 ONNX stack; event files remain readable by newer clients.
+tensorboard==2.15.2
 timm==1.0.28
 tokenizers==0.22.2
 transformers-stream-generator==0.0.5
