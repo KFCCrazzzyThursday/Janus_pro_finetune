@@ -1017,6 +1017,59 @@ def cosine_accuracy_format_weights(
     return 1.0 - format_weight, format_weight, progress
 
 
+def linear_accuracy_format_weights(
+    training_step: int,
+    first_training_step: int,
+    duration_steps: int,
+    format_start_weight: float,
+    format_end_weight: float,
+) -> tuple[float, float, float]:
+    """Return complementary weights from an inclusive linear schedule."""
+    if first_training_step < 1:
+        raise ValueError("first_training_step must be positive")
+    if duration_steps < 2:
+        raise ValueError("duration_steps must be at least 2")
+    if not 0.0 <= format_start_weight <= 1.0:
+        raise ValueError("format_start_weight must be in [0, 1]")
+    if not 0.0 <= format_end_weight <= 1.0:
+        raise ValueError("format_end_weight must be in [0, 1]")
+
+    progress = min(
+        max((training_step - first_training_step) / (duration_steps - 1), 0.0),
+        1.0,
+    )
+    format_weight = format_start_weight + (
+        format_end_weight - format_start_weight
+    ) * progress
+    return 1.0 - format_weight, format_weight, progress
+
+
+def accuracy_format_weights(
+    schedule: str,
+    training_step: int,
+    first_training_step: int,
+    duration_steps: int,
+    format_start_weight: float,
+    format_end_weight: float,
+) -> tuple[float, float, float]:
+    """Evaluate one of the persisted accuracy/format schedule types."""
+    functions = {
+        "cosine": cosine_accuracy_format_weights,
+        "linear": linear_accuracy_format_weights,
+    }
+    try:
+        function = functions[schedule]
+    except KeyError as error:
+        raise ValueError(f"Unsupported accuracy/format schedule: {schedule}") from error
+    return function(
+        training_step,
+        first_training_step,
+        duration_steps,
+        format_start_weight,
+        format_end_weight,
+    )
+
+
 def _accuracy_format_schedule_config(trainer: Any) -> dict[str, Any] | None:
     cached = getattr(trainer, "_janus_accfmt_schedule_config", None)
     if cached is not None:
@@ -1038,15 +1091,15 @@ def _accuracy_format_schedule_config(trainer: Any) -> dict[str, Any] | None:
         return None
 
     config = json.loads(path.read_text(encoding="utf-8"))
-    if config.get("schedule") != "cosine":
-        raise ValueError(f"Unsupported accuracy/format schedule in {path}: {config}")
+    schedule = str(config.get("schedule", ""))
     expected_last = int(config["first_training_step"]) + int(
         config["duration_steps"]
     ) - 1
     if int(config.get("last_training_step", expected_last)) != expected_last:
         raise ValueError(f"Inconsistent last_training_step in {path}")
     # Validate every numeric field before caching the configuration.
-    cosine_accuracy_format_weights(
+    accuracy_format_weights(
+        schedule,
         int(config["first_training_step"]),
         int(config["first_training_step"]),
         int(config["duration_steps"]),
@@ -1055,7 +1108,7 @@ def _accuracy_format_schedule_config(trainer: Any) -> dict[str, Any] | None:
     )
     normalized = {
         "path": str(path),
-        "schedule": "cosine",
+        "schedule": schedule,
         "first_training_step": int(config["first_training_step"]),
         "duration_steps": int(config["duration_steps"]),
         "last_training_step": expected_last,
@@ -1076,7 +1129,8 @@ def scheduled_accuracy_format_weights(
     # records N-1. This keeps the configured endpoints aligned with the steps
     # shown in logging.jsonl and TensorBoard.
     training_step = int(trainer.state.global_step) + 1
-    accuracy_weight, format_weight, progress = cosine_accuracy_format_weights(
+    accuracy_weight, format_weight, progress = accuracy_format_weights(
+        config["schedule"],
         training_step,
         config["first_training_step"],
         config["duration_steps"],
@@ -1186,8 +1240,9 @@ def _install_group_level_hooks() -> None:
                     if not hasattr(self, "_janus_accfmt_schedule_logged"):
                         config = self._janus_accfmt_schedule_config
                         logger.info(
-                            "Accuracy/format cosine schedule: steps %d-%d, "
+                            "Accuracy/format %s schedule: steps %d-%d, "
                             "format %.4f->%.4f (%s)",
+                            config["schedule"],
                             config["first_training_step"],
                             config["last_training_step"],
                             config["format_start_weight"],

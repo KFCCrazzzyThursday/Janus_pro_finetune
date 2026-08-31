@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "schedule": "linear",
+  "first_training_step": 391,
+  "duration_steps": 90,
+  "last_training_step": 480,
+  "format_start_weight": 0.75,
+  "format_end_weight": 0.1,
+  "accuracy_start_weight": 0.25,
+  "accuracy_end_weight": 0.9
+}

@@ -295,6 +295,7 @@ def configure_accfmt_schedule(
     duration_steps: int,
     format_start_weight: float,
     format_end_weight: float,
+    schedule: str = "cosine",
 ) -> dict[str, Any]:
     if first_training_step < 1:
         raise ValueError("first_training_step must be positive")
@@ -304,9 +305,11 @@ def configure_accfmt_schedule(
         raise ValueError("format_start_weight must be in [0, 1]")
     if not 0.0 <= format_end_weight <= 1.0:
         raise ValueError("format_end_weight must be in [0, 1]")
+    if schedule not in {"cosine", "linear"}:
+        raise ValueError("schedule must be 'cosine' or 'linear'")
     payload = {
         "format_version": 1,
-        "schedule": "cosine",
+        "schedule": schedule,
         "first_training_step": first_training_step,
         "duration_steps": duration_steps,
         "last_training_step": first_training_step + duration_steps - 1,
@@ -849,6 +852,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     schedule = subparsers.add_parser("configure-accfmt-schedule")
     schedule.add_argument("run_dir", type=Path)
+    schedule.add_argument(
+        "--schedule", choices=("cosine", "linear"), default="cosine"
+    )
     schedule.add_argument("--first-training-step", type=int, required=True)
     schedule.add_argument("--duration-steps", type=int, required=True)
     schedule.add_argument("--format-start-weight", type=float, required=True)
@@ -900,6 +906,7 @@ def main() -> int:
             args.duration_steps,
             args.format_start_weight,
             args.format_end_weight,
+            args.schedule,
         )
         print(json.dumps(result, sort_keys=True))
         return 0

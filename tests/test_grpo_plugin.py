@@ -15,8 +15,10 @@ from scienceqa_grpo import (  # noqa: E402
     JanusReasoningReward,
     _component_indices,
     _scheduled_reward_priors,
+    accuracy_format_weights,
     accuracy_format_monitoring_metrics,
     cosine_accuracy_format_weights,
+    linear_accuracy_format_weights,
     population_advantages,
     reward_monitoring_metrics,
     reward_weighting_dispersions,
@@ -73,6 +75,32 @@ def test_accuracy_format_cosine_schedule_has_inclusive_endpoints() -> None:
     assert math.isclose((left_midpoint + right_midpoint) / 2, 0.5)
 
 
+def test_accuracy_format_linear_schedule_has_inclusive_endpoints() -> None:
+    accuracy, format_weight, progress = linear_accuracy_format_weights(
+        391, 391, 90, 0.75, 0.10
+    )
+    assert (accuracy, format_weight, progress) == (0.25, 0.75, 0.0)
+
+    accuracy, format_weight, progress = linear_accuracy_format_weights(
+        480, 391, 90, 0.75, 0.10
+    )
+    assert math.isclose(accuracy, 0.90)
+    assert math.isclose(format_weight, 0.10)
+    assert progress == 1.0
+
+    _, left_midpoint, _ = linear_accuracy_format_weights(
+        435, 391, 90, 0.75, 0.10
+    )
+    _, right_midpoint, _ = linear_accuracy_format_weights(
+        436, 391, 90, 0.75, 0.10
+    )
+    assert math.isclose((left_midpoint + right_midpoint) / 2, 0.425)
+
+    assert accuracy_format_weights(
+        "linear", 420, 391, 90, 0.75, 0.10
+    ) == linear_accuracy_format_weights(420, 391, 90, 0.75, 0.10)
+
+
 def test_accuracy_format_schedule_loads_from_run_directory(tmp_path) -> None:
     config = {
         "schedule": "cosine",
@@ -89,6 +117,30 @@ def test_accuracy_format_schedule_loads_from_run_directory(tmp_path) -> None:
     )
 
     assert scheduled_accuracy_format_weights(trainer) == (0.25, 0.75, 0.0, 331)
+
+
+def test_accuracy_format_linear_schedule_loads_from_run_directory(tmp_path) -> None:
+    config = {
+        "schedule": "linear",
+        "first_training_step": 391,
+        "duration_steps": 90,
+        "last_training_step": 480,
+        "format_start_weight": 0.75,
+        "format_end_weight": 0.10,
+    }
+    (tmp_path / "accfmt_reward_schedule.json").write_text(json.dumps(config))
+    trainer = SimpleNamespace(
+        args=SimpleNamespace(output_dir=str(tmp_path)),
+        state=SimpleNamespace(global_step=419),
+    )
+
+    accuracy, format_weight, progress, training_step = (
+        scheduled_accuracy_format_weights(trainer)
+    )
+    assert training_step == 420
+    assert math.isclose(progress, 29 / 89)
+    assert math.isclose(format_weight, 0.75 - 0.65 * 29 / 89)
+    assert math.isclose(accuracy, 1.0 - format_weight)
 
 
 def test_other_partial_janus_reward_sets_remain_rejected() -> None:

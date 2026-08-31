@@ -93,6 +93,17 @@ def test_configure_accfmt_schedule_is_persisted_in_resume_state(tmp_path):
     assert state["reward_schedule"] == schedule
 
 
+def test_configure_linear_accfmt_schedule(tmp_path):
+    schedule = configure_accfmt_schedule(
+        tmp_path, 391, 90, 0.75, 0.10, schedule="linear"
+    )
+
+    assert schedule["schedule"] == "linear"
+    assert schedule["last_training_step"] == 480
+    assert schedule["accuracy_start_weight"] == 0.25
+    assert schedule["accuracy_end_weight"] == 0.90
+
+
 def test_migrate_rng_world_size_breaks_hardlinks_and_rewrites_manifest(tmp_path):
     source = make_checkpoint(tmp_path / "source", 270, world_size=5)
     for rank in range(5):
