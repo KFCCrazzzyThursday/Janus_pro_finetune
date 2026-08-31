@@ -1,6 +1,6 @@
-# PyTorch and torchvision come from the NVIDIA A100 host image. The isolated
-# venv created by scripts/setup_remote_a100.sh inherits only those CUDA-tested
-# system packages and installs this pinned userspace stack on top.
+# PyTorch and torchvision are installed separately from the official cu124
+# index by scripts/setup_remote_a100.sh. The host's PyTorch 2.3 stack is too old
+# for the pinned TRL/ms-swift FSDP APIs even though this run itself uses DDP.
 accelerate==1.14.0
 datasets==4.8.4
 einops==0.8.2

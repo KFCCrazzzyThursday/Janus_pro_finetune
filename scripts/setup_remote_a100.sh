@@ -20,11 +20,17 @@ mkdir -p "${HF_HOME}" "${HF_XET_CACHE}" "${XDG_CACHE_HOME}" \
 bash "${ROOT_DIR}/scripts/bootstrap_upstreams.sh"
 
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
-  python3 -m venv --system-site-packages "${VENV_DIR}"
+  python3 -m venv "${VENV_DIR}"
 fi
 
 "${VENV_DIR}/bin/python" -m pip --isolated install --upgrade \
   --index-url https://pypi.org/simple pip setuptools wheel
+"${VENV_DIR}/bin/python" -m pip --isolated install \
+  --index-url https://pypi.org/simple numpy==1.26.4 pillow==11.3.0
+echo "Installing the CUDA 12.4 PyTorch build for A100 GPUs."
+"${VENV_DIR}/bin/python" -m pip --isolated install \
+  --index-url https://download.pytorch.org/whl/cu124 \
+  torch==2.6.0 torchvision==0.21.0
 "${VENV_DIR}/bin/python" -m pip --isolated install \
   --index-url https://pypi.org/simple \
   -r "${ROOT_DIR}/requirements/remote-a100.txt" \
