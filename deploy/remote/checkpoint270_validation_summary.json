@@ -1,0 +1,17 @@
+{
+  "accuracy": 0.6573175116864437,
+  "batch_size_per_rank": 1,
+  "imported_from": "tqa_grpo_lora_managed30/checkpoint-270 canonical validation",
+  "max_new_tokens": 384,
+  "mean_completion_tokens": 81.46170442286947,
+  "mean_reasoning_tokens": 58.74482006543075,
+  "num_samples": 2781,
+  "parse_failure_rate": 0.007551240560949299,
+  "response_prefix": "<think>",
+  "response_prefix_conditioning": "assistant_context_without_terminal_eos",
+  "runtime_seconds": 1344.8958311080933,
+  "seed": 42,
+  "source_summary_sha256": "815e5a46067284d284273554730d82f8bfdb1c4b7edbe36ade0629077ec311ec",
+  "strict_format_rate": 0.9892125134843581,
+  "validation_world_size": 5
+}
