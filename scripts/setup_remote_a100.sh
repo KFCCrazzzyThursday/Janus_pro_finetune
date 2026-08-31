@@ -13,6 +13,7 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 # NVIDIA container images often inject an unreachable NGC extra index. The
 # explicit PyPI index below is sufficient for this userspace-only install.
 unset PIP_EXTRA_INDEX_URL
+export PIP_CONFIG_FILE=/dev/null
 mkdir -p "${HF_HOME}" "${HF_XET_CACHE}" "${XDG_CACHE_HOME}" \
   "${PIP_CACHE_DIR}" "${TMPDIR}"
 
@@ -22,12 +23,13 @@ if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
   python3 -m venv --system-site-packages "${VENV_DIR}"
 fi
 
-"${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
-"${VENV_DIR}/bin/python" -m pip install \
+"${VENV_DIR}/bin/python" -m pip --isolated install --upgrade \
+  --index-url https://pypi.org/simple pip setuptools wheel
+"${VENV_DIR}/bin/python" -m pip --isolated install \
   --index-url https://pypi.org/simple \
   -r "${ROOT_DIR}/requirements/remote-a100.txt" \
   -r "${ROOT_DIR}/upstream/ms-swift/requirements/framework.txt"
-"${VENV_DIR}/bin/python" -m pip install --no-deps \
+"${VENV_DIR}/bin/python" -m pip --isolated install --no-deps \
   -e "${ROOT_DIR}/upstream/deepseek-janus" \
   -e "${ROOT_DIR}/upstream/ms-swift"
 
